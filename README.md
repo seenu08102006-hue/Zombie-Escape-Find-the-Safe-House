@@ -1,10 +1,16 @@
 # Zombie Escape: Find the Safe House
 
-A small, self-contained browser maze game. No installation or build step is needed.
+A dependency-free browser maze game with separate HTML, CSS, and JavaScript files. The project does not use Python.
 
 ## Run the game
 
-Open `index.html` in a modern web browser.
+Keep `index.html`, `style.css`, and `game.js` together in the same folder, then open `index.html` in a modern web browser. No installation or build step is needed.
+
+## Project files
+
+- `index.html` contains the game page and interface.
+- `style.css` contains the responsive layout and visual styling.
+- `game.js` contains the maze generation, rendering, controls, and game algorithms.
 
 ## How to play
 

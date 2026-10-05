@@ -1,0 +1,926 @@
+(() => {
+"use strict";
+
+let COLS = 19;
+let ROWS = 13;
+const TILE = 40;
+const canvas = document.querySelector("#board");
+const ctx = canvas.getContext("2d");
+const minimap = document.querySelector("#minimap");
+const mapCtx = minimap.getContext("2d");
+const overlay = document.querySelector("#overlay");
+const message = document.querySelector("#message");
+const directions = {
+  up: { x: 0, y: -1 },
+  down: { x: 0, y: 1 },
+  left: { x: -1, y: 0 },
+  right: { x: 1, y: 0 }
+};
+const stages = [
+  { name: "Overgrown Village", glow: "#304337", floorA: "#26352b", floorB: "#29382d", speck: "#d4e1bd", wall: "#354439", wallTop: "#47584a", wallShadow: "#263329", wallFace: "#3d4e40" },
+  { name: "Pinewood Forest", glow: "#244634", floorA: "#20332b", floorB: "#253a30", speck: "#b6d5a2", wall: "#304b3c", wallTop: "#45634c", wallShadow: "#20372d", wallFace: "#385541" },
+  { name: "Frozen Outpost", glow: "#315263", floorA: "#283843", floorB: "#30434d", speck: "#d3eff0", wall: "#435765", wallTop: "#63808c", wallShadow: "#2c3d48", wallFace: "#506875" },
+  { name: "Ashen City", glow: "#53372d", floorA: "#37312f", floorB: "#403735", speck: "#e0b9a0", wall: "#514543", wallTop: "#76615a", wallShadow: "#342e2d", wallFace: "#5b4b47" },
+  { name: "Toxic Marsh", glow: "#455126", floorA: "#303525", floorB: "#393c27", speck: "#d3e487", wall: "#484633", wallTop: "#686447", wallShadow: "#303124", wallFace: "#555139" }
+];
+let level = 1;
+let walls;
+let player;
+let house;
+let sword;
+let zombies = [];
+let traps = [];
+let ended = false;
+let canAdvanceLevel = false;
+let collected = false;
+let random;
+let discovered = new Set();
+let score = 0;
+let steps = 0;
+let paused = false;
+let zombieTurn = 0;
+let canRetry = false;
+let theme = stages[0];
+let runSeed = Math.floor(Math.random() * 0xFFFFFFFF);
+let routeHintVisible = false;
+let routeHint = [];
+
+canvas.width = COLS * TILE;
+canvas.height = ROWS * TILE;
+minimap.width = COLS * 8;
+minimap.height = ROWS * 8;
+
+function fitBoardToViewport() {
+  const boardTop = canvas.getBoundingClientRect().top;
+  const availableWidth = Math.min(canvas.parentElement.clientWidth, window.innerWidth - 16);
+  const availableHeight = Math.max(120, window.innerHeight - boardTop - 110);
+  const scale = Math.min(1, availableWidth / canvas.width, availableHeight / canvas.height);
+  canvas.style.width = `${Math.floor(canvas.width * scale)}px`;
+}
+
+function seededRandom(seed) {
+  let value = seed >>> 0;
+  return () => {
+    value = (value * 1664525 + 1013904223) >>> 0;
+    return value / 4294967296;
+  };
+}
+
+function key(point) {
+  return `${point.x},${point.y}`;
+}
+
+function inside(point) {
+  return point.x >= 0 && point.x < COLS && point.y >= 0 && point.y < ROWS;
+}
+
+function isOpen(point) {
+  return inside(point) && !walls[point.y][point.x];
+}
+
+function neighbors(point) {
+  return Object.values(directions)
+    .map((direction) => ({ x: point.x + direction.x, y: point.y + direction.y }))
+    .filter(isOpen);
+}
+
+function distance(a, b) {
+  return Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
+}
+
+function makeMaze() {
+  walls = Array.from({ length: ROWS }, () => Array(COLS).fill(true));
+  const start = { x: 1, y: 1 };
+  const stack = [start];
+  walls[start.y][start.x] = false;
+
+  while (stack.length) {
+    const current = stack[stack.length - 1];
+    const options = Object.values(directions)
+      .map((direction) => ({ x: current.x + direction.x * 2, y: current.y + direction.y * 2, direction }))
+      .filter((next) => next.x > 0 && next.x < COLS - 1 && next.y > 0 && next.y < ROWS - 1 && walls[next.y][next.x]);
+    if (!options.length) {
+      stack.pop();
+      continue;
+    }
+    const next = options[Math.floor(random() * options.length)];
+    walls[current.y + next.direction.y][current.x + next.direction.x] = false;
+    walls[next.y][next.x] = false;
+    stack.push({ x: next.x, y: next.y });
+  }
+
+  const loopChance = Math.max(0.02, 0.08 - (level - 1) * 0.003);
+  for (let y = 1; y < ROWS - 1; y++) {
+    for (let x = 1; x < COLS - 1; x++) {
+      if (!walls[y][x] || (x % 2 === 0) === (y % 2 === 0) || random() > loopChance) continue;
+      const joinsHorizontal = x % 2 === 0;
+      const first = joinsHorizontal ? walls[y][x - 1] : walls[y - 1][x];
+      const second = joinsHorizontal ? walls[y][x + 1] : walls[y + 1][x];
+      if (!first && !second) walls[y][x] = false;
+    }
+  }
+}
+
+function aStar(start, goal) {
+  const open = [start];
+  const cameFrom = new Map();
+  const gScore = new Map([[key(start), 0]]);
+  const fScore = new Map([[key(start), distance(start, goal)]]);
+  const openKeys = new Set([key(start)]);
+
+  while (open.length) {
+    open.sort((a, b) => (fScore.get(key(a)) ?? Infinity) - (fScore.get(key(b)) ?? Infinity));
+    const current = open.shift();
+    const currentKey = key(current);
+    openKeys.delete(currentKey);
+    if (currentKey === key(goal)) {
+      const path = [current];
+      let cursor = currentKey;
+      while (cameFrom.has(cursor)) {
+        cursor = cameFrom.get(cursor);
+        const [x, y] = cursor.split(",").map(Number);
+        path.unshift({ x, y });
+      }
+      return path;
+    }
+    for (const next of neighbors(current)) {
+      const nextKey = key(next);
+      const tentative = (gScore.get(currentKey) ?? Infinity) + 1;
+      if (tentative >= (gScore.get(nextKey) ?? Infinity)) continue;
+      cameFrom.set(nextKey, currentKey);
+      gScore.set(nextKey, tentative);
+      fScore.set(nextKey, tentative + distance(next, goal));
+      if (!openKeys.has(nextKey)) {
+        open.push(next);
+        openKeys.add(nextKey);
+      }
+    }
+  }
+  return [];
+}
+
+function floodFill(start) {
+  const distances = new Map([[key(start), 0]]);
+  const queue = [start];
+  for (let index = 0; index < queue.length; index++) {
+    const current = queue[index];
+    for (const next of neighbors(current)) {
+      const nextKey = key(next);
+      if (distances.has(nextKey)) continue;
+      distances.set(nextKey, distances.get(key(current)) + 1);
+      queue.push(next);
+    }
+  }
+  return distances;
+}
+
+function dijkstra(start, goal) {
+  const frontier = [start];
+  const cameFrom = new Map();
+  const costs = new Map([[key(start), 0]]);
+  const visited = new Set();
+  const zombieTiles = new Set(zombies.map(key));
+
+  while (frontier.length) {
+    frontier.sort((a, b) => costs.get(key(a)) - costs.get(key(b)));
+    const current = frontier.shift();
+    const currentKey = key(current);
+    if (visited.has(currentKey)) continue;
+    visited.add(currentKey);
+    if (currentKey === key(goal)) {
+      const path = [current];
+      let cursor = currentKey;
+      while (cameFrom.has(cursor)) {
+        cursor = cameFrom.get(cursor);
+        const [x, y] = cursor.split(",").map(Number);
+        path.unshift({ x, y });
+      }
+      return path;
+    }
+
+    for (const next of neighbors(current)) {
+      const nextKey = key(next);
+      if (visited.has(nextKey)) continue;
+      let tileCost = 1;
+      if (traps.some((trap) => key(trap) === nextKey)) tileCost += 1000;
+      if (zombieTiles.has(nextKey)) tileCost += 30;
+      if (zombies.some((zombie) => distance(zombie, next) === 1)) tileCost += 4;
+      const nextCost = costs.get(currentKey) + tileCost;
+      if (nextCost >= (costs.get(nextKey) ?? Infinity)) continue;
+      costs.set(nextKey, nextCost);
+      cameFrom.set(nextKey, currentKey);
+      frontier.push(next);
+    }
+  }
+  return [];
+}
+
+function openTiles() {
+  const tiles = [];
+  for (let y = 1; y < ROWS - 1; y++) {
+    for (let x = 1; x < COLS - 1; x++) {
+      if (!walls[y][x]) tiles.push({ x, y });
+    }
+  }
+  return tiles;
+}
+
+function carveAlternateRoutes() {
+  const mainPath = aStar(player, house);
+  const mainPathTiles = new Set(mainPath.map(key));
+  const detours = [];
+  for (let index = 1; index < mainPath.length - 1; index++) {
+    const previous = mainPath[index - 1];
+    const current = mainPath[index];
+    const next = mainPath[index + 1];
+    if ((previous.x === next.x) || (previous.y === next.y)) continue;
+    const detour = { x: previous.x + next.x - current.x, y: previous.y + next.y - current.y };
+    if (
+      walls[detour.y][detour.x] &&
+      !mainPathTiles.has(key(detour)) &&
+      detours.every((existing) => index - existing.pathIndex >= 3 && distance(existing, detour) >= 1)
+    ) detours.push({ ...detour, pathIndex: index });
+  }
+  for (const detour of detours) walls[detour.y][detour.x] = false;
+  return { safePath: mainPath, bombRouteTiles: detours };
+}
+
+function trapCountForLevel() {
+  return level < 5 ? 1 : Math.min(6, level - 3);
+}
+
+function placeTraps(bombRouteTiles, safeRouteTiles) {
+  const wanted = trapCountForLevel();
+  traps = [];
+  const safeRoute = new Set(safeRouteTiles.map(key));
+  const candidates = bombRouteTiles.filter((tile) => !safeRoute.has(key(tile)));
+  const count = Math.min(wanted, candidates.length);
+  for (let index = 0; index < count; index++) {
+    const routeIndex = Math.floor(((index + 0.5) * candidates.length) / count);
+    const tile = candidates[routeIndex];
+    traps.push({ x: tile.x, y: tile.y });
+  }
+}
+
+function revealEntireMap() {
+  for (let y = 0; y < ROWS; y++) {
+    for (let x = 0; x < COLS; x++) {
+      discovered.add(`${x},${y}`);
+    }
+  }
+}
+
+function startLevel() {
+  const stageIndex = Math.floor((level - 1) / 3);
+  const locationIndex = (level - 1) % stages.length;
+  theme = stages[locationIndex];
+  document.documentElement.style.setProperty("--world-glow", theme.glow);
+  COLS = Math.min(23, 19 + stageIndex * 2);
+  ROWS = Math.min(17, 13 + stageIndex * 2);
+  canvas.width = COLS * TILE;
+  canvas.height = ROWS * TILE;
+  minimap.width = COLS * 8;
+  minimap.height = ROWS * 8;
+  fitBoardToViewport();
+  document.querySelector("#stage-name").textContent = `Level ${level} · ${theme.name}`;
+  random = seededRandom((runSeed + level * 92821 + 47311) >>> 0);
+  routeHint = [];
+  routeHintVisible = false;
+  document.querySelector("#route-hint").setAttribute("aria-pressed", "false");
+  player = { x: 1, y: 1 };
+  house = { x: COLS - 2, y: ROWS - 2 };
+  let routes;
+  let bestRoutes;
+  let bestWalls;
+  for (let attempt = 0; attempt < 32; attempt++) {
+    makeMaze();
+    const candidateRoutes = carveAlternateRoutes();
+    if (!bestRoutes || candidateRoutes.bombRouteTiles.length > bestRoutes.bombRouteTiles.length) {
+      bestRoutes = candidateRoutes;
+      bestWalls = walls.map((row) => [...row]);
+    }
+    if (candidateRoutes.bombRouteTiles.length >= trapCountForLevel()) {
+      routes = candidateRoutes;
+      break;
+    }
+  }
+  if (!routes) {
+    routes = bestRoutes;
+    walls = bestWalls;
+  }
+  if (routes.bombRouteTiles.length < trapCountForLevel()) {
+    throw new Error(`Could not generate two complete routes with enough bomb detours for level ${level}.`);
+  }
+  const reachable = floodFill(player);
+  const fromHouse = floodFill(house);
+  const candidates = openTiles().filter((tile) => {
+    const stepsFromStart = reachable.get(key(tile));
+    const stepsFromHouse = fromHouse.get(key(tile));
+    return stepsFromStart >= 4 && stepsFromStart <= 7 && stepsFromHouse >= 4;
+  });
+  sword = candidates.length
+    ? candidates[Math.floor(random() * candidates.length)]
+    : openTiles().find((tile) => reachable.get(key(tile)) >= 4) ?? { x: 3, y: 3 };
+  collected = false;
+  placeTraps(routes.bombRouteTiles, routes.safePath);
+
+  const spawnOptions = openTiles().filter((tile) =>
+    reachable.get(key(tile)) >= 10 &&
+    reachable.get(key(tile)) - reachable.get(key(sword)) >= 5 &&
+    fromHouse.get(key(tile)) >= 5 &&
+    !traps.some((trap) => key(trap) === key(tile))
+  );
+  for (let i = spawnOptions.length - 1; i > 0; i--) {
+    const j = Math.floor(random() * (i + 1));
+    [spawnOptions[i], spawnOptions[j]] = [spawnOptions[j], spawnOptions[i]];
+  }
+  const count = level === 1 ? 0 : Math.min(level, 5, spawnOptions.length);
+  zombies = spawnOptions.slice(0, count).map((position) => ({ ...position }));
+  ended = false;
+  canAdvanceLevel = false;
+  canRetry = false;
+  paused = false;
+  zombieTurn = 0;
+  document.querySelector("#pause").textContent = "Ⅱ Pause";
+  document.querySelector("#pause").setAttribute("aria-pressed", "false");
+  steps = 0;
+  discovered = new Set();
+  revealEntireMap();
+  overlay.hidden = true;
+  const boardWrap = document.querySelector(".board-wrap");
+  boardWrap.classList.remove("level-clear");
+  boardWrap.classList.remove("level-enter");
+  void boardWrap.offsetWidth;
+  boardWrap.classList.add("level-enter");
+  const transition = document.querySelector("#level-transition");
+  document.querySelector("#transition-kicker").textContent = level === 1 ? "Get ready" : "Entering location";
+  document.querySelector("#transition-title").textContent = theme.name;
+  document.querySelector("#transition-level").textContent = `Level ${level}`;
+  transition.classList.remove("active");
+  void transition.offsetWidth;
+  transition.classList.add("active");
+  transition.setAttribute("aria-hidden", "false");
+  const warnings = [];
+  if (level === 2) warnings.push("WARNING: zombies are entering the maze. Keep your sword ready.");
+  if (traps.length) {
+    const locations = traps.map((trap) => `(${trap.x + 1}, ${trap.y + 1})`).join(", ");
+    warnings.push(`BOMB WARNING: diamond traps at ${locations} on one route. Follow the other route to avoid them.`);
+  }
+  say(warnings.join(" "));
+  if (warnings.length) message.classList.add("message-accent");
+  updateHud();
+  draw();
+}
+
+function say(text, accent = false) {
+  message.textContent = text;
+  message.classList.toggle("message-accent", accent);
+}
+
+function updateHud() {
+  document.querySelector("#level").textContent = String(level);
+  document.querySelector("#sword-status").textContent = collected ? "Collected" : "Required";
+  document.querySelector("#zombie-count").textContent = String(zombies.length);
+  document.querySelector("#house-status").textContent = "Open";
+  document.querySelector("#score").textContent = String(score);
+  document.querySelector("#steps").textContent = String(steps);
+}
+
+function showDialog(icon, title, copy, buttonText, action) {
+  document.querySelector("#dialog-icon").textContent = icon;
+  document.querySelector("#dialog-title").textContent = title;
+  document.querySelector("#dialog-copy").textContent = copy;
+  const button = document.querySelector("#dialog-button");
+  button.textContent = buttonText;
+  button.onclick = action;
+  overlay.hidden = false;
+  button.focus();
+}
+
+function restartGame() {
+  level = 1;
+  score = 0;
+  runSeed = Math.floor(Math.random() * 0xFFFFFFFF);
+  startLevel();
+}
+
+function lose(reason) {
+  if (ended) return;
+  ended = true;
+  canAdvanceLevel = false;
+  canRetry = true;
+  draw();
+  say(reason, true);
+  showDialog("☠", reason.startsWith("BOOM!") ? "Blown up!" : "The horde caught you", `${reason} Press Space or click Try again to restart.`, "Try again", () => {
+    restartGame();
+  });
+}
+
+function finishLevel() {
+  ended = true;
+  canAdvanceLevel = true;
+  canRetry = false;
+  document.querySelector(".board-wrap").classList.add("level-clear");
+  score += level * 500;
+  updateHud();
+  const nextLevel = level + 1;
+  say(`Level ${level} complete! You found the safe house.`);
+  showDialog("⌂", `Level ${level} complete!`, "You made it to safety. Press Space or click Next level to continue.", "Next level", () => {
+    level = nextLevel;
+    startLevel();
+  });
+}
+
+function checkPickups() {
+  if (!collected && key(player) === key(sword)) {
+    collected = true;
+    score += 50 * level;
+    say(`Sword collected! You can now strike zombies from two tiles away. +${50 * level} points.`, true);
+    updateHud();
+  }
+  if (key(player) === key(house)) finishLevel();
+}
+
+function triggerTrap() {
+  const index = traps.findIndex((trap) => key(trap) === key(player));
+  if (index < 0) return true;
+  traps.splice(index, 1);
+  lose("BOOM! You stepped on a bomb trap. Game over!");
+  return false;
+}
+
+function movePlayer(name) {
+  if (ended || paused) return;
+  const direction = directions[name];
+  if (!direction) return;
+  const next = { x: player.x + direction.x, y: player.y + direction.y };
+  if (!isOpen(next)) {
+    say("A wall blocks the way.");
+    return;
+  }
+  if (zombies.some((zombie) => key(zombie) === key(next))) {
+    lose("A zombie caught you!");
+    draw();
+    return;
+  }
+  player = next;
+  steps++;
+  checkPickups();
+  if (!ended && triggerTrap()) takeZombieTurn();
+  updateHud();
+  draw();
+}
+
+function attack() {
+  if (ended || paused) return;
+  if (!collected) {
+    say("You need to collect the sword before you can attack.", true);
+    takeZombieTurn();
+    updateHud();
+    draw();
+    return;
+  }
+  const target = zombies.find((zombie) => {
+    const dx = zombie.x - player.x;
+    const dy = zombie.y - player.y;
+    const range = Math.abs(dx) + Math.abs(dy);
+    const aligned = dx === 0 || dy === 0;
+    const reach = 2;
+    const inRange = aligned && range >= 1 && range <= reach;
+    const between = range === 1 || !walls[player.y + (dy === 0 ? 0 : Math.sign(dy))][player.x + (dx === 0 ? 0 : Math.sign(dx))];
+    return inRange && between;
+  });
+  if (target) {
+    zombies = zombies.filter((zombie) => zombie !== target);
+    score += 100 * level;
+    say(`Zombie defeated! +${100 * level} points.`);
+    updateHud();
+    takeZombieTurn();
+    updateHud();
+    draw();
+    return;
+  }
+  say("No zombie in your two-tile line of attack.", true);
+  takeZombieTurn();
+  updateHud();
+  draw();
+}
+
+function takeZombieTurn() {
+  zombieTurn++;
+  if (level <= 3 && zombieTurn % 2 === 0) return;
+  for (const zombie of zombies) {
+    const path = aStar(zombie, player);
+    if (path.length > 1) {
+      const next = path[1];
+      zombie.x = next.x;
+      zombie.y = next.y;
+    }
+    if (distance(zombie, player) === 0) {
+      lose("A zombie reached you! Keep your distance or fight back.");
+      return;
+    }
+  }
+}
+
+function roundedRect(x, y, width, height, radius) {
+  ctx.beginPath();
+  ctx.roundRect(x, y, width, height, radius);
+}
+
+function drawFloor(x, y) {
+  const px = x * TILE;
+  const py = y * TILE;
+  ctx.fillStyle = (x + y) % 2 ? theme.floorA : theme.floorB;
+  ctx.fillRect(px, py, TILE, TILE);
+  ctx.fillStyle = `${theme.speck}0a`;
+  ctx.fillRect(px + 5 + ((x * 7 + y * 3) % 20), py + 8 + ((x * 5 + y * 11) % 20), 2, 2);
+  ctx.strokeStyle = "#111a142c";
+  ctx.strokeRect(px, py, TILE, TILE);
+}
+
+function drawWall(x, y) {
+  const px = x * TILE;
+  const py = y * TILE;
+  ctx.fillStyle = theme.wall;
+  ctx.fillRect(px, py, TILE, TILE);
+  ctx.fillStyle = theme.wallTop;
+  ctx.fillRect(px + 2, py + 2, TILE - 4, 8);
+  ctx.fillStyle = theme.wallShadow;
+  ctx.fillRect(px + 2, py + 12, TILE - 4, 4);
+  ctx.fillStyle = theme.wallFace;
+  ctx.fillRect(px + 2, py + 18, TILE - 4, TILE - 20);
+  ctx.strokeStyle = "#18221b";
+  ctx.strokeRect(px + .5, py + .5, TILE - 1, TILE - 1);
+}
+
+function drawHouse() {
+  const cx = house.x * TILE + TILE / 2;
+  const cy = house.y * TILE + TILE / 2 + 3;
+  ctx.save();
+  ctx.fillStyle = "#102019b8";
+  ctx.beginPath();
+  ctx.ellipse(cx, cy + 12, 19, 5, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = "#542d24";
+  ctx.fillRect(cx + 8, cy - 18, 5, 12);
+  ctx.fillStyle = "#9b4934";
+  ctx.fillRect(cx + 7, cy - 20, 7, 3);
+  ctx.fillStyle = "#d77a4a";
+  ctx.beginPath();
+  ctx.moveTo(cx - 17, cy - 2);
+  ctx.lineTo(cx, cy - 19);
+  ctx.lineTo(cx + 17, cy - 2);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = "#542d24";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.fillStyle = "#eaa06b";
+  ctx.fillRect(cx - 15, cy - 3, 30, 3);
+  ctx.fillStyle = "#b88757";
+  ctx.fillRect(cx - 12, cy, 24, 17);
+  ctx.fillStyle = "#73523c";
+  ctx.fillRect(cx - 12, cy + 13, 24, 4);
+  ctx.fillStyle = "#8de4e8";
+  ctx.fillRect(cx - 9, cy + 4, 6, 6);
+  ctx.fillRect(cx + 3, cy + 4, 6, 6);
+  ctx.fillStyle = "#476858";
+  ctx.fillRect(cx - 1, cy + 2, 2, 10);
+  ctx.fillRect(cx - 11, cy + 7, 10, 2);
+  ctx.fillRect(cx + 1, cy + 7, 10, 2);
+  ctx.fillStyle = "#573b2d";
+  ctx.fillRect(cx - 3, cy + 8, 7, 9);
+  ctx.fillStyle = "#f4d17d";
+  ctx.fillRect(cx + 2, cy + 12, 1, 1);
+  ctx.fillStyle = "#f7d77b";
+  ctx.beginPath();
+  ctx.arc(cx, cy - 1, 2, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = "#ffe7a1";
+  ctx.fillRect(cx - 1, cy - 1, 2, 1);
+  ctx.restore();
+}
+
+function drawSword() {
+  if (collected) return;
+  const cx = sword.x * TILE + TILE / 2;
+  const cy = sword.y * TILE + TILE / 2;
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(-Math.PI / 4);
+  ctx.shadowColor = "#d8f890";
+  ctx.shadowBlur = 13;
+  ctx.fillStyle = "#d9e9e5";
+  roundedRect(-3, -15, 6, 23, 2);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = "#f2f7e6";
+  ctx.beginPath();
+  ctx.moveTo(0, -20);
+  ctx.lineTo(5, -10);
+  ctx.lineTo(0, -5);
+  ctx.lineTo(-5, -10);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = "#cf9a4d";
+  roundedRect(-9, 6, 18, 4, 2);
+  ctx.fill();
+  roundedRect(-2, 9, 4, 9, 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawTrap(trap) {
+  const cx = trap.x * TILE + TILE / 2;
+  const cy = trap.y * TILE + TILE / 2;
+  ctx.fillStyle = "#ff9c4a";
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - 17);
+  ctx.lineTo(cx + 17, cy);
+  ctx.lineTo(cx, cy + 17);
+  ctx.lineTo(cx - 17, cy);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = "#542d20";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.fillStyle = "#312b29";
+  ctx.beginPath();
+  ctx.arc(cx, cy + 2, 7, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = "#f4d18b";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(cx + 3, cy - 4);
+  ctx.lineTo(cx + 7, cy - 10);
+  ctx.stroke();
+  ctx.fillStyle = "#ffe18b";
+  ctx.fillRect(cx + 6, cy - 12, 3, 3);
+}
+
+function drawPlayer() {
+  const x = player.x * TILE;
+  const y = player.y * TILE;
+  ctx.fillStyle = "#11191380";
+  ctx.fillRect(x + 9, y + 33, 23, 4);
+
+  ctx.fillStyle = "#303b49";
+  ctx.fillRect(x + 12, y + 27, 7, 9);
+  ctx.fillRect(x + 21, y + 27, 7, 9);
+  ctx.fillStyle = "#17202c";
+  ctx.fillRect(x + 11, y + 34, 9, 3);
+  ctx.fillRect(x + 20, y + 34, 9, 3);
+
+  ctx.fillStyle = "#3178aa";
+  ctx.fillRect(x + 11, y + 16, 18, 13);
+  ctx.fillStyle = "#245f91";
+  ctx.fillRect(x + 11, y + 16, 4, 13);
+  ctx.fillRect(x + 25, y + 16, 4, 13);
+  ctx.fillStyle = "#d8a477";
+  ctx.fillRect(x + 7, y + 17, 4, 11);
+  ctx.fillRect(x + 29, y + 17, 4, 11);
+  ctx.fillStyle = "#c98e60";
+  ctx.fillRect(x + 7, y + 25, 4, 3);
+  ctx.fillRect(x + 29, y + 25, 4, 3);
+
+  ctx.fillStyle = "#bd8357";
+  ctx.fillRect(x + 12, y + 4, 16, 13);
+  ctx.fillStyle = "#75482f";
+  ctx.fillRect(x + 11, y + 3, 18, 5);
+  ctx.fillRect(x + 11, y + 6, 3, 5);
+  ctx.fillRect(x + 26, y + 6, 3, 4);
+  ctx.fillStyle = "#292521";
+  ctx.fillRect(x + 15, y + 10, 3, 3);
+  ctx.fillRect(x + 23, y + 10, 3, 3);
+  ctx.fillStyle = "#f0c18d";
+  ctx.fillRect(x + 18, y + 15, 4, 2);
+  ctx.strokeStyle = "#22271f";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x + 11.5, y + 3.5, 17, 13);
+}
+
+function drawZombie(zombie) {
+  const x = zombie.x * TILE;
+  const y = zombie.y * TILE;
+  ctx.fillStyle = "#11191380";
+  ctx.fillRect(x + 8, y + 33, 24, 4);
+
+  ctx.fillStyle = "#31503b";
+  ctx.fillRect(x + 12, y + 27, 7, 9);
+  ctx.fillRect(x + 21, y + 27, 7, 9);
+  ctx.fillStyle = "#263a2e";
+  ctx.fillRect(x + 11, y + 34, 9, 3);
+  ctx.fillRect(x + 20, y + 34, 9, 3);
+
+  ctx.fillStyle = "#4e7950";
+  ctx.fillRect(x + 11, y + 16, 18, 13);
+  ctx.fillStyle = "#3f6845";
+  ctx.fillRect(x + 11, y + 16, 4, 13);
+  ctx.fillRect(x + 25, y + 16, 4, 13);
+  ctx.fillStyle = "#79a86b";
+  ctx.fillRect(x + 7, y + 17, 4, 11);
+  ctx.fillRect(x + 29, y + 17, 4, 11);
+  ctx.fillStyle = "#638e5c";
+  ctx.fillRect(x + 7, y + 25, 4, 3);
+  ctx.fillRect(x + 29, y + 25, 4, 3);
+
+  ctx.fillStyle = "#86ae72";
+  ctx.fillRect(x + 12, y + 4, 16, 13);
+  ctx.fillStyle = "#779c64";
+  ctx.fillRect(x + 11, y + 3, 18, 4);
+  ctx.fillRect(x + 11, y + 6, 3, 6);
+  ctx.fillRect(x + 26, y + 6, 3, 5);
+  ctx.fillStyle = "#ef8067";
+  ctx.fillRect(x + 15, y + 9, 4, 3);
+  ctx.fillRect(x + 23, y + 9, 4, 3);
+  ctx.fillStyle = "#422f2a";
+  ctx.fillRect(x + 18, y + 14, 5, 2);
+  ctx.fillStyle = "#a94e47";
+  ctx.fillRect(x + 19, y + 15, 3, 2);
+  ctx.strokeStyle = "#203326";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x + 11.5, y + 3.5, 17, 13);
+}
+
+function draw() {
+  if (routeHintVisible) routeHint = dijkstra(player, house);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  for (let y = 0; y < ROWS; y++) {
+    for (let x = 0; x < COLS; x++) {
+      if (discovered.has(`${x},${y}`)) {
+        walls[y][x] ? drawWall(x, y) : drawFloor(x, y);
+      } else {
+        ctx.fillStyle = "#101714";
+        ctx.fillRect(x * TILE, y * TILE, TILE, TILE);
+      }
+    }
+  }
+  if (routeHintVisible) drawRouteHint();
+  if (discovered.has(key(house))) drawHouse();
+  if (discovered.has(key(sword))) drawSword();
+  for (const trap of traps) drawTrap(trap);
+  for (const zombie of zombies) drawZombie(zombie);
+  drawPlayer();
+  drawMinimap();
+}
+
+function drawRouteHint() {
+  if (!routeHint.length) return;
+  ctx.save();
+  ctx.strokeStyle = "#72e9e2a8";
+  ctx.lineWidth = 9;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.beginPath();
+  routeHint.forEach((tile, index) => {
+    const x = tile.x * TILE + TILE / 2;
+    const y = tile.y * TILE + TILE / 2;
+    if (index === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+  ctx.fillStyle = "#a8fffa";
+  for (let index = 2; index < routeHint.length - 1; index += 3) {
+    const tile = routeHint[index];
+    ctx.beginPath();
+    ctx.arc(tile.x * TILE + TILE / 2, tile.y * TILE + TILE / 2, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawMinimap() {
+  const cell = 8;
+  mapCtx.clearRect(0, 0, minimap.width, minimap.height);
+  for (let y = 0; y < ROWS; y++) {
+    for (let x = 0; x < COLS; x++) {
+      if (!discovered.has(`${x},${y}`)) {
+        mapCtx.fillStyle = "#0c110f";
+      } else {
+        mapCtx.fillStyle = walls[y][x] ? "#465448" : "#24362a";
+      }
+      mapCtx.fillRect(x * cell, y * cell, cell - 1, cell - 1);
+    }
+  }
+  if (routeHintVisible && routeHint.length) {
+    mapCtx.strokeStyle = "#72e9e2";
+    mapCtx.lineWidth = 2;
+    mapCtx.beginPath();
+    routeHint.forEach((tile, index) => {
+      const x = tile.x * cell + cell / 2;
+      const y = tile.y * cell + cell / 2;
+      if (index === 0) mapCtx.moveTo(x, y);
+      else mapCtx.lineTo(x, y);
+    });
+    mapCtx.stroke();
+  }
+  if (discovered.has(key(sword)) && !collected) {
+    mapCtx.fillStyle = "#c3f36b";
+    mapCtx.fillRect(sword.x * cell + 2, sword.y * cell + 2, 4, 4);
+  }
+  if (discovered.has(key(house))) {
+    const x = house.x * cell;
+    const y = house.y * cell;
+    mapCtx.fillStyle = "#d77a4a";
+    mapCtx.beginPath();
+    mapCtx.moveTo(x + 1, y + 4);
+    mapCtx.lineTo(x + 4, y + 1);
+    mapCtx.lineTo(x + 7, y + 4);
+    mapCtx.closePath();
+    mapCtx.fill();
+    mapCtx.fillStyle = collected ? "#c3f36b" : "#b88757";
+    mapCtx.fillRect(x + 2, y + 4, 5, 3);
+    mapCtx.fillStyle = "#8de4e8";
+    mapCtx.fillRect(x + 3, y + 5, 1, 1);
+    mapCtx.fillRect(x + 5, y + 5, 1, 1);
+    mapCtx.fillStyle = "#573b2d";
+    mapCtx.fillRect(x + 4, y + 6, 1, 1);
+  }
+  for (const trap of traps) {
+    const cx = trap.x * cell + cell / 2;
+    const cy = trap.y * cell + cell / 2;
+    mapCtx.fillStyle = "#ff9c4a";
+    mapCtx.beginPath();
+    mapCtx.moveTo(cx, cy - 3);
+    mapCtx.lineTo(cx + 3, cy);
+    mapCtx.lineTo(cx, cy + 3);
+    mapCtx.lineTo(cx - 3, cy);
+    mapCtx.closePath();
+    mapCtx.fill();
+  }
+  for (const zombie of zombies) {
+    mapCtx.fillStyle = "#ff7665";
+    mapCtx.fillRect(zombie.x * cell + 1, zombie.y * cell + 1, 6, 6);
+  }
+  mapCtx.fillStyle = "#f3ffe0";
+  mapCtx.fillRect(player.x * cell + 1, player.y * cell + 1, 6, 6);
+}
+
+function togglePause() {
+  if (ended) return;
+  if (paused) {
+    paused = false;
+    overlay.hidden = true;
+    document.querySelector("#pause").textContent = "Ⅱ Pause";
+    document.querySelector("#pause").setAttribute("aria-pressed", "false");
+    say("Back in the maze.");
+    return;
+  }
+  paused = true;
+  document.querySelector("#pause").textContent = "▶ Resume";
+  document.querySelector("#pause").setAttribute("aria-pressed", "true");
+  showDialog("Ⅱ", "Game paused", "The horde is frozen. Take a breath, then get back to the safe house.", "Resume", togglePause);
+}
+
+document.addEventListener("keydown", (event) => {
+  const keyName = event.key.toLowerCase();
+  const moves = { arrowup: "up", w: "up", arrowdown: "down", s: "down", arrowleft: "left", a: "left", arrowright: "right", d: "right" };
+  if (keyName === "p" || keyName === "escape") {
+    event.preventDefault();
+    togglePause();
+  } else if (moves[keyName]) {
+    event.preventDefault();
+    movePlayer(moves[keyName]);
+  } else if (event.code === "Space") {
+    event.preventDefault();
+    if (ended && (canAdvanceLevel || canRetry)) {
+      document.querySelector("#dialog-button").click();
+    } else {
+      attack();
+    }
+  } else if (keyName === "f") {
+    event.preventDefault();
+    attack();
+  } else if (keyName === "r") {
+    restartGame();
+  } else if (keyName === "h") {
+    event.preventDefault();
+    routeHintVisible = !routeHintVisible;
+    document.querySelector("#route-hint").setAttribute("aria-pressed", String(routeHintVisible));
+    say(routeHintVisible ? "Dijkstra route shown. It avoids bombs and steers around zombies where possible." : "Dijkstra route hidden.");
+    draw();
+  }
+});
+
+document.querySelector("#route-hint").addEventListener("click", () => {
+  routeHintVisible = !routeHintVisible;
+  document.querySelector("#route-hint").setAttribute("aria-pressed", String(routeHintVisible));
+  say(routeHintVisible ? "Dijkstra route shown. It avoids bombs and steers around zombies where possible." : "Dijkstra route hidden.");
+  draw();
+});
+document.querySelectorAll("[data-dir]").forEach((button) => {
+  button.addEventListener("click", () => movePlayer(button.dataset.dir));
+});
+document.querySelector("[data-action='attack']").addEventListener("click", attack);
+document.querySelector("#restart").addEventListener("click", restartGame);
+document.querySelector("#pause").addEventListener("click", togglePause);
+document.querySelector("#level-transition").addEventListener("animationend", (event) => {
+  if (event.target !== event.currentTarget) return;
+  event.currentTarget.classList.remove("active");
+  event.currentTarget.setAttribute("aria-hidden", "true");
+});
+
+window.addEventListener("resize", fitBoardToViewport);
+startLevel();
+})();
