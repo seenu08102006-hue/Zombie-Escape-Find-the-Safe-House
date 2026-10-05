@@ -36,12 +36,13 @@
     .header-actions { display: flex; gap: 8px; }
     .reset { padding: 10px 14px; border: 1px solid var(--line); border-radius: 10px; background: #202a24; color: #f3f4e9; font-weight: 700; cursor: pointer; }
     .reset:hover, .control:hover { border-color: var(--green); }
+    .reset[aria-pressed="true"] { border-color: #72e9e2; color: #a8fffa; }
     .stats { display: grid; grid-template-columns: repeat(7, 1fr); gap: 10px; margin-bottom: 12px; }
     .stat { min-width: 0; padding: 11px 14px; border: 1px solid var(--line); border-radius: 12px; background: #19211e; }
     .stat-label { display: block; color: var(--muted); font-size: 10px; font-weight: 800; letter-spacing: .13em; text-transform: uppercase; }
     .stat-value { display: block; overflow: hidden; margin-top: 2px; font-size: 16px; font-weight: 800; text-overflow: ellipsis; white-space: normal; }
     .board-wrap { position: relative; overflow: hidden; border: 1px solid #465448; border-radius: 16px; background: #17201a; box-shadow: 0 18px 60px #0007; }
-    canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; }
+    canvas { display: block; width: 100%; height: auto; margin-inline: auto; image-rendering: pixelated; }
     .board-wrap.level-clear canvas { animation: level-clear .85s ease-out; }
     .board-wrap.level-enter canvas { animation: level-enter .8s cubic-bezier(.2,.8,.2,1); }
     .level-transition { position: absolute; inset: 0; z-index: 1; display: grid; place-items: center; pointer-events: none; opacity: 0; visibility: hidden; background: #101814d9; }
@@ -93,16 +94,22 @@
     .instructions strong { color: #f3f4e9; }
     kbd { padding: 2px 6px; border: 1px solid #526052; border-radius: 5px; background: #273129; color: #eef1e6; font: 11px ui-monospace, monospace; }
     @media (max-width: 650px) {
-      body { padding: 16px 12px; }
-      header { align-items: start; }
-      .header-actions { flex-direction: column; }
-      .subtitle { font-size: 13px; }
-      .stats { grid-template-columns: repeat(3, 1fr); gap: 7px; }
-      .stat { padding: 9px 11px; }
+      body { padding: 10px 8px; }
+      header { align-items: center; gap: 8px; margin-bottom: 9px; }
+      .eyebrow { font-size: 9px; }
+      h1 { font-size: clamp(21px, 6vw, 30px); }
+      .subtitle { display: none; }
+      .header-actions { flex-direction: row; flex-wrap: wrap; justify-content: end; gap: 5px; }
+      .reset { padding: 7px 8px; font-size: 11px; }
+      .stats { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 5px; margin-bottom: 7px; }
+      .stat { padding: 6px 7px; }
+      .stat-label { font-size: 8px; letter-spacing: .08em; }
+      .stat-value { font-size: 13px; }
       .below { grid-template-columns: 1fr auto; gap: 10px; }
       .map-card { grid-column: 1 / -1; grid-row: 2; justify-self: start; }
-      #minimap { width: 190px; }
-      .instructions { gap: 8px 12px; font-size: 12px; }
+      #minimap { width: 140px; }
+      .below { margin-top: 7px; }
+      .instructions { gap: 6px 10px; margin-top: 9px; padding: 9px 10px; font-size: 11px; }
     }
   </style>
 </head>
@@ -115,6 +122,7 @@
         <p class="subtitle">Scout the whole maze. Fight back or slip past the horde.</p>
       </div>
       <div class="header-actions">
+        <button id="route-hint" class="reset" type="button" aria-pressed="false">⌖ Safe route</button>
         <button id="pause" class="reset" type="button" aria-pressed="false">Ⅱ Pause</button>
         <button id="restart" class="reset" type="button">↻ Restart</button>
       </div>
@@ -166,6 +174,7 @@
       <span><strong>Bombs:</strong> one route has marked bomb detours; take the other route to avoid them</span>
       <span><strong>Goal:</strong> reach the safe house whenever you are ready</span>
       <span><strong>Danger:</strong> do not let a zombie occupy your tile</span>
+      <span><strong>Algorithms:</strong> BFS explores maze distances, A* chases you, Dijkstra plans a safer route with <kbd>H</kbd></span>
     </section>
   </main>
   <script>
@@ -213,11 +222,21 @@
       let canRetry = false;
       let theme = stages[0];
       let runSeed = Math.floor(Math.random() * 0xFFFFFFFF);
+      let routeHintVisible = false;
+      let routeHint = [];
 
       canvas.width = COLS * TILE;
       canvas.height = ROWS * TILE;
       minimap.width = COLS * 8;
       minimap.height = ROWS * 8;
+
+      function fitBoardToViewport() {
+        const boardTop = canvas.getBoundingClientRect().top;
+        const availableWidth = Math.min(canvas.parentElement.clientWidth, window.innerWidth - 16);
+        const availableHeight = Math.max(120, window.innerHeight - boardTop - 110);
+        const scale = Math.min(1, availableWidth / canvas.width, availableHeight / canvas.height);
+        canvas.style.width = `${Math.floor(canvas.width * scale)}px`;
+      }
 
       function seededRandom(seed) {
         let value = seed >>> 0;
@@ -335,6 +354,47 @@
         return distances;
       }
 
+      function dijkstra(start, goal) {
+        const frontier = [start];
+        const cameFrom = new Map();
+        const costs = new Map([[key(start), 0]]);
+        const visited = new Set();
+        const zombieTiles = new Set(zombies.map(key));
+
+        while (frontier.length) {
+          frontier.sort((a, b) => costs.get(key(a)) - costs.get(key(b)));
+          const current = frontier.shift();
+          const currentKey = key(current);
+          if (visited.has(currentKey)) continue;
+          visited.add(currentKey);
+          if (currentKey === key(goal)) {
+            const path = [current];
+            let cursor = currentKey;
+            while (cameFrom.has(cursor)) {
+              cursor = cameFrom.get(cursor);
+              const [x, y] = cursor.split(",").map(Number);
+              path.unshift({ x, y });
+            }
+            return path;
+          }
+
+          for (const next of neighbors(current)) {
+            const nextKey = key(next);
+            if (visited.has(nextKey)) continue;
+            let tileCost = 1;
+            if (traps.some((trap) => key(trap) === nextKey)) tileCost += 1000;
+            if (zombieTiles.has(nextKey)) tileCost += 30;
+            if (zombies.some((zombie) => distance(zombie, next) === 1)) tileCost += 4;
+            const nextCost = costs.get(currentKey) + tileCost;
+            if (nextCost >= (costs.get(nextKey) ?? Infinity)) continue;
+            costs.set(nextKey, nextCost);
+            cameFrom.set(nextKey, currentKey);
+            frontier.push(next);
+          }
+        }
+        return [];
+      }
+
       function openTiles() {
         const tiles = [];
         for (let y = 1; y < ROWS - 1; y++) {
@@ -401,8 +461,12 @@
         canvas.height = ROWS * TILE;
         minimap.width = COLS * 8;
         minimap.height = ROWS * 8;
+        fitBoardToViewport();
         document.querySelector("#stage-name").textContent = `Level ${level} · ${theme.name}`;
         random = seededRandom((runSeed + level * 92821 + 47311) >>> 0);
+        routeHint = [];
+        routeHintVisible = false;
+        document.querySelector("#route-hint").setAttribute("aria-pressed", "false");
         player = { x: 1, y: 1 };
         house = { x: COLS - 2, y: ROWS - 2 };
         let routes;
@@ -860,6 +924,7 @@
       }
 
       function draw() {
+        if (routeHintVisible) routeHint = dijkstra(player, house);
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         for (let y = 0; y < ROWS; y++) {
           for (let x = 0; x < COLS; x++) {
@@ -871,12 +936,38 @@
             }
           }
         }
+        if (routeHintVisible) drawRouteHint();
         if (discovered.has(key(house))) drawHouse();
         if (discovered.has(key(sword))) drawSword();
         for (const trap of traps) drawTrap(trap);
         for (const zombie of zombies) drawZombie(zombie);
         drawPlayer();
         drawMinimap();
+      }
+
+      function drawRouteHint() {
+        if (!routeHint.length) return;
+        ctx.save();
+        ctx.strokeStyle = "#72e9e2a8";
+        ctx.lineWidth = 9;
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.beginPath();
+        routeHint.forEach((tile, index) => {
+          const x = tile.x * TILE + TILE / 2;
+          const y = tile.y * TILE + TILE / 2;
+          if (index === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+        ctx.fillStyle = "#a8fffa";
+        for (let index = 2; index < routeHint.length - 1; index += 3) {
+          const tile = routeHint[index];
+          ctx.beginPath();
+          ctx.arc(tile.x * TILE + TILE / 2, tile.y * TILE + TILE / 2, 3, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.restore();
       }
 
       function drawMinimap() {
@@ -891,6 +982,18 @@
             }
             mapCtx.fillRect(x * cell, y * cell, cell - 1, cell - 1);
           }
+        }
+        if (routeHintVisible && routeHint.length) {
+          mapCtx.strokeStyle = "#72e9e2";
+          mapCtx.lineWidth = 2;
+          mapCtx.beginPath();
+          routeHint.forEach((tile, index) => {
+            const x = tile.x * cell + cell / 2;
+            const y = tile.y * cell + cell / 2;
+            if (index === 0) mapCtx.moveTo(x, y);
+            else mapCtx.lineTo(x, y);
+          });
+          mapCtx.stroke();
         }
         if (discovered.has(key(sword)) && !collected) {
           mapCtx.fillStyle = "#c3f36b";
@@ -971,9 +1074,21 @@
           attack();
         } else if (keyName === "r") {
           restartGame();
+        } else if (keyName === "h") {
+          event.preventDefault();
+          routeHintVisible = !routeHintVisible;
+          document.querySelector("#route-hint").setAttribute("aria-pressed", String(routeHintVisible));
+          say(routeHintVisible ? "Dijkstra route shown. It avoids bombs and steers around zombies where possible." : "Dijkstra route hidden.");
+          draw();
         }
       });
 
+      document.querySelector("#route-hint").addEventListener("click", () => {
+        routeHintVisible = !routeHintVisible;
+        document.querySelector("#route-hint").setAttribute("aria-pressed", String(routeHintVisible));
+        say(routeHintVisible ? "Dijkstra route shown. It avoids bombs and steers around zombies where possible." : "Dijkstra route hidden.");
+        draw();
+      });
       document.querySelectorAll("[data-dir]").forEach((button) => {
         button.addEventListener("click", () => movePlayer(button.dataset.dir));
       });
@@ -986,6 +1101,7 @@
         event.currentTarget.setAttribute("aria-hidden", "true");
       });
 
+      window.addEventListener("resize", fitBoardToViewport);
       startLevel();
     })();
   </script>

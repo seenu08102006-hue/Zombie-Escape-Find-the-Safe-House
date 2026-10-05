@@ -9,6 +9,8 @@ Open `index.html` in a modern web browser.
 ## How to play
 
 - Move with **WASD**, the **arrow keys**, or the on-screen direction buttons.
+- The complete maze automatically scales to fit the available screen width and height, including on later, larger levels.
+- The game uses **BFS** to explore maze distances, **A\*** for zombie pursuit, and **Dijkstra's algorithm** to calculate a route that avoids bombs and steers around zombies where possible. Click **Safe route** or press **H** to show or hide the route.
 - The entire maze, safe house, sword, and all zombies are visible from the start.
 - Collect the sword before attacking. Once you have it, attack a zombie from any side within two tiles using **Space**, **F**, or the on-screen sword button.
 - Zombies use **A\*** pathfinding to chase you. A zombie sharing your tile catches you, so attack or move before it closes the gap.
