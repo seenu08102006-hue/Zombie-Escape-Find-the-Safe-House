@@ -36,12 +36,14 @@ let discovered = new Set();
 let score = 0;
 let steps = 0;
 let paused = false;
-let zombieTurn = 0;
 let canRetry = false;
 let theme = stages[0];
 let runSeed = Math.floor(Math.random() * 0xFFFFFFFF);
 let routeHintVisible = true;
 let routeHint = [];
+let requiredRoute = [];
+let requiredMoves = [];
+let routeStepLimit = 0;
 
 canvas.width = COLS * TILE;
 canvas.height = ROWS * TILE;
@@ -189,6 +191,25 @@ function aStarSafeRoute(start, goal) {
   });
 }
 
+function getExactRouteMoves(path) {
+  if (path.length < 2) return [];
+  const moves = [];
+  for (let index = 1; index < path.length; index++) {
+    const previous = path[index - 1];
+    const current = path[index];
+    if (current.x > previous.x) moves.push("right");
+    else if (current.x < previous.x) moves.push("left");
+    else if (current.y > previous.y) moves.push("down");
+    else if (current.y < previous.y) moves.push("up");
+  }
+  return moves;
+}
+
+function formatRouteMoves(moves) {
+  if (!moves.length) return "No route";
+  return moves.map((move) => move[0].toUpperCase() + move.slice(1)).join(" → ");
+}
+
 function openTiles() {
   const tiles = [];
   for (let y = 1; y < ROWS - 1; y++) {
@@ -212,7 +233,7 @@ function carveAlternateRoutes() {
     if (
       walls[detour.y][detour.x] &&
       !mainPathTiles.has(key(detour)) &&
-      detours.every((existing) => index - existing.pathIndex >= 3 && distance(existing, detour) >= 1)
+      detours.every((existing) => distance(existing, detour) >= 1)
     ) detours.push({ ...detour, pathIndex: index });
   }
   for (const detour of detours) walls[detour.y][detour.x] = false;
@@ -220,7 +241,7 @@ function carveAlternateRoutes() {
 }
 
 function trapCountForLevel() {
-  return level < 5 ? 1 : Math.min(6, level - 3);
+  return level < 5 ? 3 : Math.min(8, level - 1);
 }
 
 function placeTraps(bombRouteTiles, safeRouteTiles) {
@@ -259,6 +280,9 @@ function startLevel() {
   document.querySelector("#stage-name").textContent = `Level ${level} · ${theme.name}`;
   random = seededRandom((runSeed + level * 92821 + 47311) >>> 0);
   routeHint = [];
+  requiredRoute = [];
+  requiredMoves = [];
+  routeStepLimit = 0;
   routeHintVisible = true;
   document.querySelector("#route-hint").setAttribute("aria-pressed", "true");
   player = { x: 1, y: 1 };
@@ -288,7 +312,12 @@ function startLevel() {
   const reachable = floodFill(player);
   const fromHouse = floodFill(house);
   placeTraps(routes.bombRouteTiles, routes.safePath);
-  const safeRouteTiles = new Set(routes.safePath.map(key));
+  const trapTiles = new Set(traps.map(key));
+  const exactPath = aStar(player, house, (_, next) => trapTiles.has(key(next)) ? Infinity : 1);
+  if (!exactPath.length) {
+    throw new Error(`Could not find a bomb-free route to the safe house for level ${level}.`);
+  }
+  const safeRouteTiles = new Set(exactPath.map(key));
 
   const spawnOptions = openTiles().filter((tile) =>
     reachable.get(key(tile)) >= 10 &&
@@ -306,7 +335,6 @@ function startLevel() {
   canAdvanceLevel = false;
   canRetry = false;
   paused = false;
-  zombieTurn = 0;
   document.querySelector("#pause").textContent = "Ⅱ Pause";
   document.querySelector("#pause").setAttribute("aria-pressed", "false");
   steps = 0;
@@ -326,13 +354,22 @@ function startLevel() {
   void transition.offsetWidth;
   transition.classList.add("active");
   transition.setAttribute("aria-hidden", "false");
+  requiredRoute = exactPath;
+  requiredMoves = getExactRouteMoves(requiredRoute);
+  routeStepLimit = requiredMoves.length;
+  if (routeStepLimit === 0 && key(player) !== key(house)) {
+    throw new Error(`Could not calculate the exact move count for level ${level}.`);
+  }
+  routeHint = requiredRoute;
+
   const warnings = [];
-  if (level === 2) warnings.push("WARNING: zombies are entering the maze. Keep moving and dodge them.");
+  if (level === 2) warnings.push("WARNING: zombies are in the maze. They stay still, so plan your route around them.");
   if (traps.length) {
     const locations = traps.map((trap) => `(${trap.x + 1}, ${trap.y + 1})`).join(", ");
     warnings.push(`BOMB WARNING: diamond traps at ${locations} on one route. Follow the other route to avoid them.`);
   }
-  say(warnings.join(" "));
+  const exactRouteMessage = `Exact route: ${formatRouteMoves(requiredMoves)}. Total moves: ${routeStepLimit}.`;
+  say(`${exactRouteMessage} ${warnings.join(" ")}`);
   if (warnings.length) message.classList.add("message-accent");
   updateHud();
   draw();
@@ -343,12 +380,21 @@ function say(text, accent = false) {
   message.classList.toggle("message-accent", accent);
 }
 
+function refreshRouteHint() {
+  routeHint = aStarSafeRoute(player, house);
+  if (!routeHint.length && zombies.length && !ended) {
+    say("Zombies block every safe route. Move away or wait for an opening.");
+  }
+}
+
 function updateHud() {
+  refreshRouteHint();
   document.querySelector("#level").textContent = String(level);
   document.querySelector("#zombie-count").textContent = String(zombies.length);
   document.querySelector("#house-status").textContent = "Open";
   document.querySelector("#score").textContent = String(score);
   document.querySelector("#steps").textContent = String(steps);
+  document.querySelector("#step-limit").textContent = String(routeStepLimit);
 }
 
 function showDialog(icon, title, copy, buttonText, action) {
@@ -369,14 +415,15 @@ function restartGame() {
   startLevel();
 }
 
-function lose(reason) {
+function lose(reason, title = "The horde caught you") {
   if (ended) return;
   ended = true;
   canAdvanceLevel = false;
   canRetry = true;
   draw();
   say(reason, true);
-  showDialog("☠", reason.startsWith("BOOM!") ? "Blown up!" : "The horde caught you", `${reason} Press Space or click Try again to retry Level ${level}.`, "Try this level again", () => {
+  if (reason.startsWith("BOOM!")) title = "Blown up!";
+  showDialog("☠", title, `${reason} Press Space or click Try again to retry Level ${level}.`, "Try this level again", () => {
     startLevel();
   });
 }
@@ -397,7 +444,20 @@ function finishLevel() {
 }
 
 function checkGoal() {
-  if (key(player) === key(house)) finishLevel();
+  if (key(player) === key(house)) {
+    finishLevel();
+    return true;
+  }
+  return false;
+}
+
+function checkRouteLimit() {
+  if (!routeStepLimit || ended) return false;
+  if (steps > routeStepLimit) {
+    lose(`Game over! You used ${steps} steps, but the safe house can be reached in ${routeStepLimit}. Restart Level ${level} and try again.`, "Out of moves");
+    return true;
+  }
+  return false;
 }
 
 function triggerTrap() {
@@ -424,57 +484,17 @@ function movePlayer(name) {
   }
   player = next;
   steps++;
-  checkGoal();
-  if (!ended && triggerTrap()) takeZombieTurn();
+  updateHud();
+  if (!triggerTrap()) return;
+  if (checkRouteLimit()) return;
+  if (checkGoal()) return;
   updateHud();
   draw();
 }
 
 function waitTurn() {
   if (ended || paused) return;
-  takeZombieTurn();
-  updateHud();
-  draw();
-}
-
-function takeZombieTurn() {
-  zombieTurn++;
-  if (level <= 3 && zombieTurn % 2 === 0 && aStarSafeRoute(player, house).length) return;
-  for (const zombie of zombies) {
-    const otherZombieTiles = new Set(zombies.filter((other) => other !== zombie).map(key));
-    const chasePath = aStar(zombie, player);
-    const chaseStep = chasePath[1];
-    const options = [
-      ...(chaseStep ? [chaseStep] : []),
-      ...neighbors(zombie)
-        .filter((tile) => !otherZombieTiles.has(key(tile)) && key(tile) !== key(player))
-        .sort((a, b) => distance(a, player) - distance(b, player)),
-      zombie
-    ];
-    const seenOptions = new Set();
-    let chosen = zombie;
-
-    for (const option of options) {
-      const optionKey = key(option);
-      if (seenOptions.has(optionKey) || otherZombieTiles.has(optionKey) || optionKey === key(player)) continue;
-      seenOptions.add(optionKey);
-      const previous = { x: zombie.x, y: zombie.y };
-      zombie.x = option.x;
-      zombie.y = option.y;
-      if (aStarSafeRoute(player, house).length) {
-        chosen = option;
-        break;
-      }
-      zombie.x = previous.x;
-      zombie.y = previous.y;
-    }
-    zombie.x = chosen.x;
-    zombie.y = chosen.y;
-    if (distance(zombie, player) === 0) {
-      lose("A zombie reached you! Keep dodging and stay out of its way.");
-      return;
-    }
-  }
+  say("Zombies stay in place. Keep moving to the safe house.");
 }
 
 function drawFloor(x, y) {
@@ -664,12 +684,7 @@ function drawZombie(zombie) {
 }
 
 function draw() {
-  if (routeHintVisible) {
-    routeHint = aStarSafeRoute(player, house);
-    if (!routeHint.length && zombies.length && !ended) {
-      say("Zombies block every safe route. Move away or wait for an opening.");
-    }
-  }
+  refreshRouteHint();
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   for (let y = 0; y < ROWS; y++) {
     for (let x = 0; x < COLS; x++) {

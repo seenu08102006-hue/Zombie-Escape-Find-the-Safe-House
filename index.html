@@ -27,6 +27,7 @@
       <div class="stat"><span class="stat-label">Safe house</span><span id="house-status" class="stat-value">Open</span></div>
       <div class="stat"><span class="stat-label">Score</span><span id="score" class="stat-value">0</span></div>
       <div class="stat"><span class="stat-label">Steps</span><span id="steps" class="stat-value">0</span></div>
+      <div class="stat"><span class="stat-label">Exact steps</span><span id="step-limit" class="stat-value">0</span></div>
     </section>
     <div class="board-wrap">
       <canvas id="board" aria-label="The complete maze. Use arrow keys or WASD to move, Space to wait."></canvas>
@@ -61,7 +62,7 @@
     </div>
     <section class="instructions" aria-label="How to play">
       <span><strong>Move:</strong> <kbd>WASD</kbd> or <kbd>↑←↓→</kbd></span>
-      <span><strong>Wait:</strong> press <kbd>Space</kbd> to let zombies move; they try not to block your safe route</span>
+      <span><strong>Zombies:</strong> they stay in place; avoid their tiles</span>
       <span><strong>Bombs:</strong> one route has marked bomb detours; take the other route to avoid them</span>
       <span><strong>Goal:</strong> reach the safe house whenever you are ready</span>
       <span><strong>Danger:</strong> do not move onto a zombie; dodge them to survive</span>
