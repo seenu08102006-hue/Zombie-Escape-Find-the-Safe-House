@@ -27,12 +27,10 @@ let level = 1;
 let walls;
 let player;
 let house;
-let sword;
 let zombies = [];
 let traps = [];
 let ended = false;
 let canAdvanceLevel = false;
-let collected = false;
 let random;
 let discovered = new Set();
 let score = 0;
@@ -42,7 +40,7 @@ let zombieTurn = 0;
 let canRetry = false;
 let theme = stages[0];
 let runSeed = Math.floor(Math.random() * 0xFFFFFFFF);
-let routeHintVisible = false;
+let routeHintVisible = true;
 let routeHint = [];
 
 canvas.width = COLS * TILE;
@@ -121,7 +119,7 @@ function makeMaze() {
   }
 }
 
-function aStar(start, goal) {
+function aStar(start, goal, costFn = () => 1) {
   const open = [start];
   const cameFrom = new Map();
   const gScore = new Map([[key(start), 0]]);
@@ -145,7 +143,7 @@ function aStar(start, goal) {
     }
     for (const next of neighbors(current)) {
       const nextKey = key(next);
-      const tentative = (gScore.get(currentKey) ?? Infinity) + 1;
+      const tentative = (gScore.get(currentKey) ?? Infinity) + costFn(current, next, currentKey, nextKey);
       if (tentative >= (gScore.get(nextKey) ?? Infinity)) continue;
       cameFrom.set(nextKey, currentKey);
       gScore.set(nextKey, tentative);
@@ -174,45 +172,21 @@ function floodFill(start) {
   return distances;
 }
 
-function dijkstra(start, goal) {
-  const frontier = [start];
-  const cameFrom = new Map();
-  const costs = new Map([[key(start), 0]]);
-  const visited = new Set();
+function aStarSafeRoute(start, goal) {
+  const trapTiles = new Set(traps.map(key));
   const zombieTiles = new Set(zombies.map(key));
+  return aStar(start, goal, (_, next) => {
+    const nextKey = key(next);
+    if (trapTiles.has(nextKey) || zombieTiles.has(nextKey)) return Infinity;
 
-  while (frontier.length) {
-    frontier.sort((a, b) => costs.get(key(a)) - costs.get(key(b)));
-    const current = frontier.shift();
-    const currentKey = key(current);
-    if (visited.has(currentKey)) continue;
-    visited.add(currentKey);
-    if (currentKey === key(goal)) {
-      const path = [current];
-      let cursor = currentKey;
-      while (cameFrom.has(cursor)) {
-        cursor = cameFrom.get(cursor);
-        const [x, y] = cursor.split(",").map(Number);
-        path.unshift({ x, y });
-      }
-      return path;
+    let cost = 1;
+    for (const zombie of zombies) {
+      const zombieDistance = distance(next, zombie);
+      if (zombieDistance === 1) cost += 24;
+      else if (zombieDistance === 2) cost += 6;
     }
-
-    for (const next of neighbors(current)) {
-      const nextKey = key(next);
-      if (visited.has(nextKey)) continue;
-      let tileCost = 1;
-      if (traps.some((trap) => key(trap) === nextKey)) tileCost += 1000;
-      if (zombieTiles.has(nextKey)) tileCost += 30;
-      if (zombies.some((zombie) => distance(zombie, next) === 1)) tileCost += 4;
-      const nextCost = costs.get(currentKey) + tileCost;
-      if (nextCost >= (costs.get(nextKey) ?? Infinity)) continue;
-      costs.set(nextKey, nextCost);
-      cameFrom.set(nextKey, currentKey);
-      frontier.push(next);
-    }
-  }
-  return [];
+    return cost;
+  });
 }
 
 function openTiles() {
@@ -285,8 +259,8 @@ function startLevel() {
   document.querySelector("#stage-name").textContent = `Level ${level} · ${theme.name}`;
   random = seededRandom((runSeed + level * 92821 + 47311) >>> 0);
   routeHint = [];
-  routeHintVisible = false;
-  document.querySelector("#route-hint").setAttribute("aria-pressed", "false");
+  routeHintVisible = true;
+  document.querySelector("#route-hint").setAttribute("aria-pressed", "true");
   player = { x: 1, y: 1 };
   house = { x: COLS - 2, y: ROWS - 2 };
   let routes;
@@ -313,21 +287,13 @@ function startLevel() {
   }
   const reachable = floodFill(player);
   const fromHouse = floodFill(house);
-  const candidates = openTiles().filter((tile) => {
-    const stepsFromStart = reachable.get(key(tile));
-    const stepsFromHouse = fromHouse.get(key(tile));
-    return stepsFromStart >= 4 && stepsFromStart <= 7 && stepsFromHouse >= 4;
-  });
-  sword = candidates.length
-    ? candidates[Math.floor(random() * candidates.length)]
-    : openTiles().find((tile) => reachable.get(key(tile)) >= 4) ?? { x: 3, y: 3 };
-  collected = false;
   placeTraps(routes.bombRouteTiles, routes.safePath);
+  const safeRouteTiles = new Set(routes.safePath.map(key));
 
   const spawnOptions = openTiles().filter((tile) =>
     reachable.get(key(tile)) >= 10 &&
-    reachable.get(key(tile)) - reachable.get(key(sword)) >= 5 &&
     fromHouse.get(key(tile)) >= 5 &&
+    !safeRouteTiles.has(key(tile)) &&
     !traps.some((trap) => key(trap) === key(tile))
   );
   for (let i = spawnOptions.length - 1; i > 0; i--) {
@@ -361,7 +327,7 @@ function startLevel() {
   transition.classList.add("active");
   transition.setAttribute("aria-hidden", "false");
   const warnings = [];
-  if (level === 2) warnings.push("WARNING: zombies are entering the maze. Keep your sword ready.");
+  if (level === 2) warnings.push("WARNING: zombies are entering the maze. Keep moving and dodge them.");
   if (traps.length) {
     const locations = traps.map((trap) => `(${trap.x + 1}, ${trap.y + 1})`).join(", ");
     warnings.push(`BOMB WARNING: diamond traps at ${locations} on one route. Follow the other route to avoid them.`);
@@ -379,7 +345,6 @@ function say(text, accent = false) {
 
 function updateHud() {
   document.querySelector("#level").textContent = String(level);
-  document.querySelector("#sword-status").textContent = collected ? "Collected" : "Required";
   document.querySelector("#zombie-count").textContent = String(zombies.length);
   document.querySelector("#house-status").textContent = "Open";
   document.querySelector("#score").textContent = String(score);
@@ -411,8 +376,8 @@ function lose(reason) {
   canRetry = true;
   draw();
   say(reason, true);
-  showDialog("☠", reason.startsWith("BOOM!") ? "Blown up!" : "The horde caught you", `${reason} Press Space or click Try again to restart.`, "Try again", () => {
-    restartGame();
+  showDialog("☠", reason.startsWith("BOOM!") ? "Blown up!" : "The horde caught you", `${reason} Press Space or click Try again to retry Level ${level}.`, "Try this level again", () => {
+    startLevel();
   });
 }
 
@@ -431,13 +396,7 @@ function finishLevel() {
   });
 }
 
-function checkPickups() {
-  if (!collected && key(player) === key(sword)) {
-    collected = true;
-    score += 50 * level;
-    say(`Sword collected! You can now strike zombies from two tiles away. +${50 * level} points.`, true);
-    updateHud();
-  }
+function checkGoal() {
   if (key(player) === key(house)) finishLevel();
 }
 
@@ -459,48 +418,20 @@ function movePlayer(name) {
     return;
   }
   if (zombies.some((zombie) => key(zombie) === key(next))) {
-    lose("A zombie caught you!");
+    lose("A zombie caught you! Keep dodging and find another way.");
     draw();
     return;
   }
   player = next;
   steps++;
-  checkPickups();
+  checkGoal();
   if (!ended && triggerTrap()) takeZombieTurn();
   updateHud();
   draw();
 }
 
-function attack() {
+function waitTurn() {
   if (ended || paused) return;
-  if (!collected) {
-    say("You need to collect the sword before you can attack.", true);
-    takeZombieTurn();
-    updateHud();
-    draw();
-    return;
-  }
-  const target = zombies.find((zombie) => {
-    const dx = zombie.x - player.x;
-    const dy = zombie.y - player.y;
-    const range = Math.abs(dx) + Math.abs(dy);
-    const aligned = dx === 0 || dy === 0;
-    const reach = 2;
-    const inRange = aligned && range >= 1 && range <= reach;
-    const between = range === 1 || !walls[player.y + (dy === 0 ? 0 : Math.sign(dy))][player.x + (dx === 0 ? 0 : Math.sign(dx))];
-    return inRange && between;
-  });
-  if (target) {
-    zombies = zombies.filter((zombie) => zombie !== target);
-    score += 100 * level;
-    say(`Zombie defeated! +${100 * level} points.`);
-    updateHud();
-    takeZombieTurn();
-    updateHud();
-    draw();
-    return;
-  }
-  say("No zombie in your two-tile line of attack.", true);
   takeZombieTurn();
   updateHud();
   draw();
@@ -508,24 +439,42 @@ function attack() {
 
 function takeZombieTurn() {
   zombieTurn++;
-  if (level <= 3 && zombieTurn % 2 === 0) return;
+  if (level <= 3 && zombieTurn % 2 === 0 && aStarSafeRoute(player, house).length) return;
   for (const zombie of zombies) {
-    const path = aStar(zombie, player);
-    if (path.length > 1) {
-      const next = path[1];
-      zombie.x = next.x;
-      zombie.y = next.y;
+    const otherZombieTiles = new Set(zombies.filter((other) => other !== zombie).map(key));
+    const chasePath = aStar(zombie, player);
+    const chaseStep = chasePath[1];
+    const options = [
+      ...(chaseStep ? [chaseStep] : []),
+      ...neighbors(zombie)
+        .filter((tile) => !otherZombieTiles.has(key(tile)) && key(tile) !== key(player))
+        .sort((a, b) => distance(a, player) - distance(b, player)),
+      zombie
+    ];
+    const seenOptions = new Set();
+    let chosen = zombie;
+
+    for (const option of options) {
+      const optionKey = key(option);
+      if (seenOptions.has(optionKey) || otherZombieTiles.has(optionKey) || optionKey === key(player)) continue;
+      seenOptions.add(optionKey);
+      const previous = { x: zombie.x, y: zombie.y };
+      zombie.x = option.x;
+      zombie.y = option.y;
+      if (aStarSafeRoute(player, house).length) {
+        chosen = option;
+        break;
+      }
+      zombie.x = previous.x;
+      zombie.y = previous.y;
     }
+    zombie.x = chosen.x;
+    zombie.y = chosen.y;
     if (distance(zombie, player) === 0) {
-      lose("A zombie reached you! Keep your distance or fight back.");
+      lose("A zombie reached you! Keep dodging and stay out of its way.");
       return;
     }
   }
-}
-
-function roundedRect(x, y, width, height, radius) {
-  ctx.beginPath();
-  ctx.roundRect(x, y, width, height, radius);
 }
 
 function drawFloor(x, y) {
@@ -599,35 +548,6 @@ function drawHouse() {
   ctx.fill();
   ctx.fillStyle = "#ffe7a1";
   ctx.fillRect(cx - 1, cy - 1, 2, 1);
-  ctx.restore();
-}
-
-function drawSword() {
-  if (collected) return;
-  const cx = sword.x * TILE + TILE / 2;
-  const cy = sword.y * TILE + TILE / 2;
-  ctx.save();
-  ctx.translate(cx, cy);
-  ctx.rotate(-Math.PI / 4);
-  ctx.shadowColor = "#d8f890";
-  ctx.shadowBlur = 13;
-  ctx.fillStyle = "#d9e9e5";
-  roundedRect(-3, -15, 6, 23, 2);
-  ctx.fill();
-  ctx.shadowBlur = 0;
-  ctx.fillStyle = "#f2f7e6";
-  ctx.beginPath();
-  ctx.moveTo(0, -20);
-  ctx.lineTo(5, -10);
-  ctx.lineTo(0, -5);
-  ctx.lineTo(-5, -10);
-  ctx.closePath();
-  ctx.fill();
-  ctx.fillStyle = "#cf9a4d";
-  roundedRect(-9, 6, 18, 4, 2);
-  ctx.fill();
-  roundedRect(-2, 9, 4, 9, 2);
-  ctx.fill();
   ctx.restore();
 }
 
@@ -744,7 +664,12 @@ function drawZombie(zombie) {
 }
 
 function draw() {
-  if (routeHintVisible) routeHint = dijkstra(player, house);
+  if (routeHintVisible) {
+    routeHint = aStarSafeRoute(player, house);
+    if (!routeHint.length && zombies.length && !ended) {
+      say("Zombies block every safe route. Move away or wait for an opening.");
+    }
+  }
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   for (let y = 0; y < ROWS; y++) {
     for (let x = 0; x < COLS; x++) {
@@ -758,7 +683,6 @@ function draw() {
   }
   if (routeHintVisible) drawRouteHint();
   if (discovered.has(key(house))) drawHouse();
-  if (discovered.has(key(sword))) drawSword();
   for (const trap of traps) drawTrap(trap);
   for (const zombie of zombies) drawZombie(zombie);
   drawPlayer();
@@ -768,8 +692,8 @@ function draw() {
 function drawRouteHint() {
   if (!routeHint.length) return;
   ctx.save();
-  ctx.strokeStyle = "#72e9e2a8";
-  ctx.lineWidth = 9;
+  ctx.strokeStyle = "#061b35";
+  ctx.lineWidth = 12;
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
   ctx.beginPath();
@@ -780,7 +704,10 @@ function drawRouteHint() {
     else ctx.lineTo(x, y);
   });
   ctx.stroke();
-  ctx.fillStyle = "#a8fffa";
+  ctx.strokeStyle = "#168cff";
+  ctx.lineWidth = 7;
+  ctx.stroke();
+  ctx.fillStyle = "#9bd5ff";
   for (let index = 2; index < routeHint.length - 1; index += 3) {
     const tile = routeHint[index];
     ctx.beginPath();
@@ -804,8 +731,8 @@ function drawMinimap() {
     }
   }
   if (routeHintVisible && routeHint.length) {
-    mapCtx.strokeStyle = "#72e9e2";
-    mapCtx.lineWidth = 2;
+    mapCtx.strokeStyle = "#168cff";
+    mapCtx.lineWidth = 2.5;
     mapCtx.beginPath();
     routeHint.forEach((tile, index) => {
       const x = tile.x * cell + cell / 2;
@@ -814,10 +741,6 @@ function drawMinimap() {
       else mapCtx.lineTo(x, y);
     });
     mapCtx.stroke();
-  }
-  if (discovered.has(key(sword)) && !collected) {
-    mapCtx.fillStyle = "#c3f36b";
-    mapCtx.fillRect(sword.x * cell + 2, sword.y * cell + 2, 4, 4);
   }
   if (discovered.has(key(house))) {
     const x = house.x * cell;
@@ -829,7 +752,7 @@ function drawMinimap() {
     mapCtx.lineTo(x + 7, y + 4);
     mapCtx.closePath();
     mapCtx.fill();
-    mapCtx.fillStyle = collected ? "#c3f36b" : "#b88757";
+    mapCtx.fillStyle = "#b88757";
     mapCtx.fillRect(x + 2, y + 4, 5, 3);
     mapCtx.fillStyle = "#8de4e8";
     mapCtx.fillRect(x + 3, y + 5, 1, 1);
@@ -887,18 +810,15 @@ document.addEventListener("keydown", (event) => {
     if (ended && (canAdvanceLevel || canRetry)) {
       document.querySelector("#dialog-button").click();
     } else {
-      attack();
+      waitTurn();
     }
-  } else if (keyName === "f") {
-    event.preventDefault();
-    attack();
   } else if (keyName === "r") {
     restartGame();
   } else if (keyName === "h") {
     event.preventDefault();
     routeHintVisible = !routeHintVisible;
     document.querySelector("#route-hint").setAttribute("aria-pressed", String(routeHintVisible));
-    say(routeHintVisible ? "Dijkstra route shown. It avoids bombs and steers around zombies where possible." : "Dijkstra route hidden.");
+    say(routeHintVisible ? "A* safe route shown in blue; it avoids bombs and zombie tiles." : "Safe route hidden.");
     draw();
   }
 });
@@ -906,13 +826,12 @@ document.addEventListener("keydown", (event) => {
 document.querySelector("#route-hint").addEventListener("click", () => {
   routeHintVisible = !routeHintVisible;
   document.querySelector("#route-hint").setAttribute("aria-pressed", String(routeHintVisible));
-  say(routeHintVisible ? "Dijkstra route shown. It avoids bombs and steers around zombies where possible." : "Dijkstra route hidden.");
+  say(routeHintVisible ? "A* safe route shown in blue; it avoids bombs and zombie tiles." : "Safe route hidden.");
   draw();
 });
 document.querySelectorAll("[data-dir]").forEach((button) => {
   button.addEventListener("click", () => movePlayer(button.dataset.dir));
 });
-document.querySelector("[data-action='attack']").addEventListener("click", attack);
 document.querySelector("#restart").addEventListener("click", restartGame);
 document.querySelector("#pause").addEventListener("click", togglePause);
 document.querySelector("#level-transition").addEventListener("animationend", (event) => {
