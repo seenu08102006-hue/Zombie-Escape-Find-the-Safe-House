@@ -24,15 +24,20 @@ def a_star(grid: List[List[int]], start: Position, goal: Position) -> Optional[L
     grid: 0 = walkable cell, 1 = blocked cell
     start, goal: (row, col) tuples
     """
-    rows = len(grid)
-    cols = len(grid[0]) if rows > 0 else 0
+    if not grid or not grid[0]:
+        return None
 
-    if not grid or not (0 <= start[0] < rows and 0 <= start[1] < cols):
+    rows = len(grid)
+    cols = len(grid[0])
+
+    if not (0 <= start[0] < rows and 0 <= start[1] < cols):
         return None
     if not (0 <= goal[0] < rows and 0 <= goal[1] < cols):
         return None
     if grid[start[0]][start[1]] == 1 or grid[goal[0]][goal[1]] == 1:
         return None
+    if start == goal:
+        return [start]
 
     open_heap: List[Tuple[int, int, Position]] = []
     heapq.heappush(open_heap, (0, 0, start))
