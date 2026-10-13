@@ -1,0 +1,637 @@
+from __future__ import annotations
+
+import copy
+import html
+import random
+from collections import deque
+from dataclasses import dataclass, field
+from threading import Event
+from typing import Optional
+
+import reacton.ipyvuetify as v
+import solara
+
+from a_star import Position, a_star
+
+
+LOCATIONS = (
+    "Overgrown Village",
+    "Pinewood Forest",
+    "Frozen Outpost",
+    "Ashen City",
+    "Toxic Marsh",
+)
+DIRECTIONS: dict[str, Position] = {
+    "Up": (0, -1),
+    "Down": (0, 1),
+    "Left": (-1, 0),
+    "Right": (1, 0),
+}
+PLAYER_ICON = (
+    '<svg class="game-icon player-icon" viewBox="0 0 24 24" aria-hidden="true">'
+    '<path d="M7 10h3v7H7z" fill="#c77c42"/>'
+    '<circle cx="12" cy="5.5" r="3.2" fill="#f2bd8d"/>'
+    '<path d="M8.8 5a3.25 3.25 0 0 1 6.4 0v1H8.8z" fill="#423632"/>'
+    '<path d="M8 9.5h8l1.5 7H6.5z" fill="#63c6a7"/>'
+    '<path d="M9 16h2v5H8.5zM13 16h2l.5 5h-2.5z" fill="#d9e5dc"/>'
+    '<path d="M9 11.5h6" stroke="#ffe29a" stroke-width="1.2"/>'
+    '</svg>'
+)
+HOUSE_ICON = (
+    '<svg class="game-icon house-icon" viewBox="0 0 24 24" aria-hidden="true">'
+    '<path d="M2.5 11 12 3l9.5 8v2H2.5z" fill="#f1a65b"/>'
+    '<path d="M5 11h14v10H5z" fill="#e8d1a4"/>'
+    '<path d="M10 14h4v7h-4z" fill="#76503a"/>'
+    '<path d="M6.5 13h2v2h-2zM15.5 13h2v2h-2z" fill="#6c9c96"/>'
+    '<path d="M17 4h2v5l-2-1z" fill="#bac9c2"/>'
+    '</svg>'
+)
+
+
+@dataclass
+class Zombie:
+    position: Position
+    home: Position
+    previous: Optional[Position] = None
+
+
+@dataclass
+class Game:
+    level: int
+    score: int
+    seed: int
+    walls: list[list[bool]]
+    player: Position
+    house: Position
+    zombies: list[Zombie]
+    traps: set[Position]
+    route: list[Position]
+    exact_steps: int
+    steps: int = 0
+    route_visible: bool = True
+    paused: bool = False
+    ended: Optional[str] = None
+    message: str = ""
+    rng: random.Random = field(default_factory=random.Random, repr=False)
+
+
+def path_on(walls: list[list[bool]], start: Position, goal: Position,
+            blocked: set[Position] | None = None) -> list[Position]:
+    blocked = blocked or set()
+    grid = [
+        [int(walls[y][x] or (x, y) in blocked) for x in range(len(walls[0]))]
+        for y in range(len(walls))
+    ]
+    path = a_star(grid, (start[1], start[0]), (goal[1], goal[0]))
+    return [(x, y) for y, x in path] if path else []
+
+
+def open_neighbors(walls: list[list[bool]], point: Position) -> list[Position]:
+    x, y = point
+    candidates = ((x, y - 1), (x, y + 1), (x - 1, y), (x + 1, y))
+    return [
+        tile for tile in candidates
+        if 0 <= tile[1] < len(walls)
+        and 0 <= tile[0] < len(walls[0])
+        and not walls[tile[1]][tile[0]]
+    ]
+
+
+def make_maze(width: int, height: int, rng: random.Random, level: int) -> list[list[bool]]:
+    walls = [[True] * width for _ in range(height)]
+    start = (1, 1)
+    walls[start[1]][start[0]] = False
+    stack: list[Position] = [start]
+    while stack:
+        x, y = stack[-1]
+        options = [
+            (x + dx * 2, y + dy * 2, dx, dy)
+            for dx, dy in DIRECTIONS.values()
+            if 0 < x + dx * 2 < width - 1 and 0 < y + dy * 2 < height - 1
+            and walls[y + dy * 2][x + dx * 2]
+        ]
+        if not options:
+            stack.pop()
+            continue
+        nx, ny, dx, dy = rng.choice(options)
+        walls[y + dy][x + dx] = False
+        walls[ny][nx] = False
+        stack.append((nx, ny))
+
+    loop_chance = max(0.02, 0.08 - (level - 1) * 0.003)
+    for y in range(1, height - 1):
+        for x in range(1, width - 1):
+            if not walls[y][x] or (x % 2 == 0) == (y % 2 == 0):
+                continue
+            if rng.random() > loop_chance:
+                continue
+            neighbors = ((x - 1, y), (x + 1, y)) if x % 2 == 0 else ((x, y - 1), (x, y + 1))
+            if all(not walls[ny][nx] for nx, ny in neighbors):
+                walls[y][x] = False
+    return walls
+
+
+def add_detours(walls: list[list[bool]], start: Position, goal: Position) -> tuple[list[Position], list[Position]]:
+    main_path = path_on(walls, start, goal)
+    path_tiles = set(main_path)
+    detours: list[Position] = []
+    for index in range(1, len(main_path) - 1):
+        previous, current, following = main_path[index - 1:index + 2]
+        if previous[0] == following[0] or previous[1] == following[1]:
+            continue
+        detour = (previous[0] + following[0] - current[0], previous[1] + following[1] - current[1])
+        x, y = detour
+        if walls[y][x] and detour not in path_tiles and detour not in detours:
+            detours.append(detour)
+    for x, y in detours:
+        walls[y][x] = False
+    return main_path, detours
+
+
+def distances_from(walls: list[list[bool]], start: Position) -> dict[Position, int]:
+    distances = {start: 0}
+    queue = deque([start])
+    while queue:
+        current = queue.popleft()
+        for neighbor in open_neighbors(walls, current):
+            if neighbor not in distances:
+                distances[neighbor] = distances[current] + 1
+                queue.append(neighbor)
+    return distances
+
+
+def trap_count(level: int) -> int:
+    if level <= 0:
+        raise ValueError("Level must be a positive integer.")
+    return 3 if level < 5 else min(8, level - 1)
+
+
+def start_level(level: int, score: int, seed: int) -> Game:
+    if level <= 0:
+        raise ValueError("Level must be a positive integer.")
+    size_step = min((level - 1) // 3, 2)
+    width, height = min(23, 19 + 2 * size_step), min(17, 13 + 2 * size_step)
+    start, house = (1, 1), (width - 2, height - 2)
+    rng = random.Random((seed + level * 92821 + 47311) & 0xFFFFFFFF)
+    best: tuple[list[list[bool]], list[Position], list[Position]] | None = None
+    for _ in range(32):
+        walls = make_maze(width, height, rng, level)
+        safe_path, detours = add_detours(walls, start, house)
+        if best is None or len(detours) > len(best[2]):
+            best = (walls, safe_path, detours)
+        if len(detours) >= trap_count(level):
+            best = (walls, safe_path, detours)
+            break
+    if best is None or len(best[2]) < trap_count(level):
+        raise RuntimeError(f"Could not generate enough alternate route tiles for level {level}.")
+
+    walls, safe_path, detours = best
+    count = min(trap_count(level), len(detours))
+    traps = {
+        detours[min(len(detours) - 1, int((index + 0.5) * len(detours) / count))]
+        for index in range(count)
+    }
+    exact_path = path_on(walls, start, house, traps)
+    if not exact_path:
+        raise RuntimeError(f"Could not find a bomb-free route for level {level}.")
+
+    from_start = distances_from(walls, start)
+    from_house = distances_from(walls, house)
+    safe_tiles = set(exact_path)
+    spawn_options = [
+        (x, y)
+        for y in range(1, height - 1)
+        for x in range(1, width - 1)
+        if not walls[y][x]
+        and from_start.get((x, y), 0) >= 10
+        and from_house.get((x, y), 0) >= 5
+        and (x, y) not in safe_tiles
+        and (x, y) not in traps
+    ]
+    rng.shuffle(spawn_options)
+    zombie_count = 0 if level == 1 else min(level, 5, len(spawn_options))
+    zombies = [Zombie(tile, tile) for tile in spawn_options[:zombie_count]]
+
+    location = LOCATIONS[(level - 1) % len(LOCATIONS)]
+    return Game(
+        level=level,
+        score=score,
+        seed=seed,
+        walls=walls,
+        player=start,
+        house=house,
+        zombies=zombies,
+        traps=traps,
+        route=exact_path,
+        exact_steps=len(exact_path) - 1,
+        message=f"Level {level} · {location}. Reach the safe house without stepping on a bomb.",
+        rng=rng,
+    )
+
+
+def current_route(game: Game) -> list[Position]:
+    occupied = {zombie.position for zombie in game.zombies}
+    return path_on(game.walls, game.player, game.house, game.traps | occupied)
+
+
+def move_zombies(game: Game) -> None:
+    occupied = {zombie.position for zombie in game.zombies}
+    for zombie in game.zombies:
+        occupied.discard(zombie.position)
+        options = [
+            tile for tile in open_neighbors(game.walls, zombie.position)
+            if abs(tile[0] - zombie.home[0]) + abs(tile[1] - zombie.home[1]) <= 3
+            and tile != game.house
+            and tile not in game.traps
+            and tile not in occupied
+        ]
+        forward = [tile for tile in options if tile != zombie.previous]
+        if forward:
+            options = forward
+        zombie.previous = zombie.position
+        if options:
+            zombie.position = game.rng.choice(options)
+        occupied.add(zombie.position)
+
+
+def end_game(game: Game, message: str, outcome: str = "lost") -> None:
+    game.ended = outcome
+    game.message = message
+
+
+def take_turn(game: Game, direction: str | None) -> None:
+    if game.ended or game.paused:
+        return
+    if direction is not None:
+        dx, dy = DIRECTIONS[direction]
+        target = (game.player[0] + dx, game.player[1] + dy)
+        if game.walls[target[1]][target[0]]:
+            game.message = "A wall blocks the way."
+            return
+        if any(zombie.position == target for zombie in game.zombies):
+            end_game(game, "A zombie caught you! Retry the level to try again.")
+            return
+        game.player = target
+        game.steps += 1
+        if game.player in game.traps:
+            end_game(game, "BOOM! You stepped on a bomb trap. Retry the level to try again.")
+            return
+        if game.steps > game.exact_steps:
+            end_game(game, f"You used more than the {game.exact_steps} steps available on the exact route.")
+            return
+        if game.player == game.house:
+            game.score += game.level * 500
+            end_game(game, f"Level {game.level} complete! You found the safe house.", "won")
+            return
+    move_zombies(game)
+    if any(zombie.position == game.player for zombie in game.zombies):
+        end_game(game, "A roaming zombie caught you! Retry the level to try again.")
+    else:
+        game.message = "You wait as the zombies patrol." if direction is None else "The zombies patrol nearby."
+
+
+def board_markup(game: Game) -> str:
+    route = set(current_route(game)) if game.route_visible else set()
+    zombies = {zombie.position for zombie in game.zombies}
+    tiles = []
+    for y, row in enumerate(game.walls):
+        for x, wall in enumerate(row):
+            point = (x, y)
+            if point == game.player:
+                cell, kind = PLAYER_ICON, "player"
+            elif point in zombies:
+                cell, kind = "🧟", "zombie"
+            elif point == game.house:
+                cell, kind = HOUSE_ICON, "house"
+            elif point in game.traps:
+                cell, kind = "💣", "bomb"
+            elif wall:
+                cell, kind = "", "wall"
+            elif point in route:
+                cell, kind = "", "route"
+            else:
+                cell, kind = "", "floor"
+            tiles.append(
+                f'<div class="maze-tile {kind}" role="gridcell">{cell}</div>'
+            )
+    return (
+        f'<div class="maze-board" role="grid" aria-label="Maze, level {game.level}" '
+        f'style="grid-template-columns:repeat({len(game.walls[0])}, minmax(0, 1fr));">'
+        f'{"".join(tiles)}</div>'
+    )
+
+
+GAME_STYLES = """
+html, body, #root, .solara-app, .v-application, .v-application__wrap,
+.v-main, .v-main__wrap {
+    background: #0b1110 !important;
+    color: #e8efeb;
+}
+.v-application__wrap div[style*="position: absolute"][style*="bottom: 0px"] {
+    display: none !important;
+}
+body { margin: 0; }
+.zombie-game {
+    box-sizing: border-box;
+    width: min(100%, 1120px);
+    min-height: 100vh;
+    margin: 0 auto;
+    padding: 30px 32px 40px;
+    background: #0b1110;
+    color: #e8efeb;
+    font-family: Inter, Arial, sans-serif;
+    outline: none;
+}
+.zombie-game * { box-sizing: border-box; }
+.zombie-game:focus-visible { outline: 2px solid #7cae42; outline-offset: -2px; }
+.game-heading {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 24px; margin-bottom: 22px;
+}
+.game-eyebrow {
+    color: #b7f34a; font: 800 13px/1.3 Inter, sans-serif;
+    letter-spacing: .2em; text-transform: uppercase; margin-bottom: 8px;
+}
+.game-title {
+    color: #f4f7f3; font: 800 clamp(30px, 4vw, 44px)/1 'Barlow Condensed', Inter, sans-serif;
+    letter-spacing: -.025em; margin: 0 0 8px;
+}
+.game-subtitle { color: #9aa9a2; font-size: 14px; margin: 0; }
+.game-heading-actions { display: flex; align-items: center; gap: 10px; }
+.zombie-game .game-heading-actions { background: transparent !important; }
+.game-stats {
+    display: grid; grid-template-columns: repeat(5, minmax(90px, 1fr));
+    gap: 10px; margin: 0 0 18px;
+}
+.game-stat {
+    min-height: 68px; padding: 12px 14px; border: 1px solid #293731;
+    border-radius: 12px; background: #111a17;
+}
+.game-stat-label {
+    display: block; color: #94a59c; font: 700 10px/1.3 Inter, sans-serif;
+    letter-spacing: .15em; text-transform: uppercase; margin-bottom: 7px;
+}
+.game-stat-value { color: #f0f4ef; font: 800 18px/1 'Barlow Condensed', Inter, sans-serif; }
+.maze-frame {
+    padding: 10px; border: 1px solid #31443d; border-radius: 15px;
+    background: #131d1a; box-shadow: 0 14px 42px #0005;
+}
+.maze-board {
+    display: grid; width: 100%; overflow: hidden;
+    border: 1px solid #435a60; border-radius: 9px;
+    background: #293b40; gap: 2px; padding: 2px;
+}
+.maze-tile {
+    position: relative; display: flex; align-items: center; justify-content: center;
+    min-width: 0; aspect-ratio: 1; overflow: hidden;
+    color: white; font: 700 clamp(10px, 1.5vw, 18px)/1 Arial, sans-serif;
+}
+.maze-tile.wall {
+    border: 1px solid #6d8992; border-radius: 2px;
+    background: linear-gradient(180deg, #506770 0 43%, #33494f 44% 54%, #49616a 55% 100%);
+    box-shadow: inset 0 1px #a0b1b5, inset 0 -1px #25383d;
+}
+.maze-tile.floor { background: #26383d; }
+.maze-tile.route {
+    background: #075185; box-shadow: inset 0 0 0 2px #078cf4;
+}
+.maze-tile.player, .maze-tile.zombie, .maze-tile.house, .maze-tile.bomb {
+    z-index: 1; filter: drop-shadow(0 2px 2px #0009);
+}
+.maze-tile.player { background: #174b50; }
+.maze-tile.zombie { background: #3b4c35; }
+.maze-tile.house { background: #65513b; }
+.maze-tile.bomb { color: #ff9751; background: #4c342b; }
+.game-icon { display: block; width: 90%; height: 90%; }
+.game-below {
+    display: grid; grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center; gap: 20px; margin-top: 14px;
+}
+.game-legend { display: flex; flex-wrap: wrap; gap: 8px 16px; color: #a7b5af; font-size: 12px; }
+.legend-item { display: inline-flex; align-items: center; gap: 6px; }
+.legend-icon {
+    display: inline-flex; width: 22px; height: 22px; align-items: center; justify-content: center;
+    border: 1px solid #354740; border-radius: 5px; background: #17221e; font-size: 13px;
+}
+.legend-icon .game-icon { width: 18px; height: 18px; }
+.game-controls { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-top: 20px; }
+.game-move-controls { display: grid; grid-template-columns: repeat(3, 48px); gap: 6px; }
+.game-move-controls .v-btn:first-child { grid-column: 2; }
+.game-move-controls .v-btn:nth-child(2) { grid-column: 1; grid-row: 2; }
+.game-move-controls .v-btn:nth-child(3) { grid-column: 3; grid-row: 2; }
+.game-move-controls .v-btn:nth-child(4) { grid-column: 2; grid-row: 3; }
+.game-message {
+    margin-top: 14px; padding: 12px 15px; border: 1px solid #30423a;
+    border-radius: 9px; background: #111a17; color: #c5d1ca; font-size: 13px;
+}
+.game-help { margin-top: 16px; color: #8d9e95; font-size: 12px; line-height: 1.6; }
+.zombie-game .game-button, .zombie-game .game-button .v-btn {
+    min-height: 42px; border: 1px solid #34483e !important; border-radius: 9px !important;
+    background: #17221d !important; color: #e8efeb !important;
+    font: 700 12px Inter, sans-serif !important; letter-spacing: .02em !important;
+    box-shadow: none !important;
+}
+.zombie-game .game-button.primary, .zombie-game .game-button.primary .v-btn {
+    border-color: #7cae42 !important; background: #b7f34a !important; color: #15200e !important;
+}
+.zombie-game .game-button:hover, .zombie-game .game-button .v-btn:hover { filter: brightness(1.12); }
+@media (max-width: 700px) {
+    .zombie-game { padding: 20px 12px 28px; }
+    .game-heading { align-items: flex-start; flex-direction: column; gap: 14px; }
+    .game-heading-actions { width: 100%; }
+    .game-heading-actions > * { flex: 1; }
+    .game-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
+    .game-stat { min-height: 60px; padding: 10px; }
+    .game-stat-value { font-size: 16px; }
+    .game-controls { align-items: flex-start; flex-direction: column-reverse; }
+    .game-below { grid-template-columns: 1fr; }
+}
+"""
+
+
+@solara.component
+def Page():
+    initial_game = solara.use_memo(lambda: start_level(1, 0, random.randrange(2**32)), [])
+    game = solara.use_reactive(initial_game)
+    ai_running, set_ai_running = solara.use_state(False)
+
+    def change(action):
+        updated = copy.deepcopy(game.value)
+        action(updated)
+        game.value = updated
+
+    def move(direction: str) -> None:
+        set_ai_running(False)
+        change(lambda state: take_turn(state, direction))
+
+    def wait() -> None:
+        set_ai_running(False)
+        change(lambda state: take_turn(state, None))
+
+    def restart() -> None:
+        set_ai_running(False)
+        game.value = start_level(game.value.level, game.value.score, game.value.seed)
+
+    def next_level() -> None:
+        set_ai_running(False)
+        game.value = start_level(game.value.level + 1, game.value.score, game.value.seed)
+
+    def handle_keydown(_widget, _event, data) -> None:
+        key = data.get("key", data.get("code")) if isinstance(data, dict) else None
+        direction = {
+            "ArrowUp": "Up",
+            "ArrowDown": "Down",
+            "ArrowLeft": "Left",
+            "ArrowRight": "Right",
+            "Up": "Up",
+            "Down": "Down",
+            "Left": "Left",
+            "Right": "Right",
+        }.get(key)
+        if direction is not None:
+            move(direction)
+
+    def run_ai(cancel: Event) -> None:
+        if not ai_running:
+            return
+        while not cancel.is_set():
+            state = game.value
+            if state.ended:
+                set_ai_running(False)
+                return
+            if state.paused:
+                cancel.wait(0.1)
+                continue
+
+            route = current_route(state)
+            if len(route) < 2:
+                change(lambda current: setattr(
+                    current, "message", "AI cannot find a safe route to the safe house."
+                ))
+                set_ai_running(False)
+                return
+
+            current, following = route[:2]
+            delta = (following[0] - current[0], following[1] - current[1])
+            direction = next(
+                (name for name, step in DIRECTIONS.items() if step == delta),
+                None,
+            )
+            if direction is None:
+                raise RuntimeError(f"AI route contains a non-adjacent step: {current} to {following}.")
+
+            change(lambda current_state: take_turn(current_state, direction))
+            if game.value.ended:
+                set_ai_running(False)
+                return
+            cancel.wait(0.4)
+
+    solara.use_thread(run_ai, dependencies=[ai_running])
+
+    def toggle_pause() -> None:
+        def update(state: Game) -> None:
+            state.paused = not state.paused
+            state.message = "Game paused." if state.paused else "Back in the maze."
+
+        change(update)
+
+    def toggle_route() -> None:
+        def update(state: Game) -> None:
+            state.route_visible = not state.route_visible
+            state.message = "Safe path shown." if state.route_visible else "Safe path hidden."
+
+        change(update)
+
+    state = game.value
+    location = LOCATIONS[(state.level - 1) % len(LOCATIONS)]
+    solara.Title("Zombie Escape: Find the Safe House")
+    solara.Style(GAME_STYLES)
+    status = "Escaped!" if state.ended == "won" else "Lost" if state.ended == "lost" else "Open"
+    can_move = state.ended is None and not state.paused
+    game_root = solara.Div(
+        classes=["zombie-game"],
+        attributes={"tabindex": "0"},
+    )
+    with game_root:
+        with solara.Div(classes=["game-heading"]):
+            solara.HTML(
+                unsafe_innerHTML=(
+                    f'<div class="game-eyebrow">Level {state.level} · '
+                    f'{html.escape(location)}</div><h1 class="game-title">Zombie Escape</h1>'
+                    '<p class="game-subtitle">Scout the maze. Find the safe house. '
+                    'Don’t let the horde catch you.</p>'
+                )
+            )
+            with solara.Row(classes=["game-heading-actions"], gap="10px"):
+                solara.Button(
+                    "Stop AI" if ai_running else "Start AI",
+                    on_click=lambda: set_ai_running(not ai_running),
+                    disabled=state.ended is not None,
+                    classes=["game-button", "primary"],
+                )
+                solara.Button(
+                    "Safe path" if not state.route_visible else "Hide path",
+                    on_click=toggle_route,
+                    classes=["game-button"],
+                )
+                solara.Button(
+                    "Resume" if state.paused else "Pause",
+                    on_click=toggle_pause,
+                    disabled=state.ended is not None,
+                    classes=["game-button"],
+                )
+                solara.Button("Restart", on_click=restart, classes=["game-button"])
+        solara.HTML(
+            unsafe_innerHTML=(
+                '<div class="game-stats">'
+                f'<div class="game-stat"><span class="game-stat-label">Level</span>'
+                f'<span class="game-stat-value">{state.level}</span></div>'
+                f'<div class="game-stat"><span class="game-stat-label">Zombies</span>'
+                f'<span class="game-stat-value">{len(state.zombies)}</span></div>'
+                f'<div class="game-stat"><span class="game-stat-label">Safe house</span>'
+                f'<span class="game-stat-value">{status}</span></div>'
+                f'<div class="game-stat"><span class="game-stat-label">Score</span>'
+                f'<span class="game-stat-value">{state.score}</span></div>'
+                f'<div class="game-stat"><span class="game-stat-label">Steps</span>'
+                f'<span class="game-stat-value">{state.steps}/{state.exact_steps}</span></div>'
+                '</div>'
+            )
+        )
+        with solara.Div(classes=["maze-frame"]):
+            solara.HTML(unsafe_innerHTML=board_markup(state))
+        with solara.Div(classes=["game-below"]):
+            solara.HTML(
+                unsafe_innerHTML=(
+                    '<div class="game-legend">'
+                    f'<span class="legend-item"><span class="legend-icon">{PLAYER_ICON}</span>You</span>'
+                    '<span class="legend-item"><span class="legend-icon">🧟</span>Zombie</span>'
+                    f'<span class="legend-item"><span class="legend-icon">{HOUSE_ICON}</span>Safe house</span>'
+                    '<span class="legend-item"><span class="legend-icon">💣</span>Bomb</span>'
+                    '<span class="legend-item"><span class="legend-icon" style="color:#078cf4">+</span>Safe route</span>'
+                    '</div>'
+                )
+            )
+            if state.ended == "won":
+                solara.Button("Next level", on_click=next_level, classes=["game-button", "primary"])
+            elif state.ended == "lost":
+                solara.Button("Retry level", on_click=restart, classes=["game-button", "primary"])
+        with solara.Div(classes=["game-controls"]):
+            with solara.Row(classes=["game-heading-actions"], gap="8px"):
+                solara.Button("Wait", on_click=wait, disabled=not can_move, classes=["game-button"])
+                solara.Button("Restart level", on_click=restart, classes=["game-button"])
+            with solara.Div(classes=["game-move-controls"]):
+                solara.Button("↑", on_click=lambda: move("Up"), disabled=not can_move, classes=["game-button"])
+                solara.Button("←", on_click=lambda: move("Left"), disabled=not can_move, classes=["game-button"])
+                solara.Button("→", on_click=lambda: move("Right"), disabled=not can_move, classes=["game-button"])
+                solara.Button("↓", on_click=lambda: move("Down"), disabled=not can_move, classes=["game-button"])
+        solara.HTML(
+            unsafe_innerHTML=(
+                f'<div class="game-message">{html.escape(state.message)}</div>'
+                '<div class="game-help"><strong>How to play:</strong> Click inside or Tab to focus the game, '
+                'then use the keyboard '
+                'arrow keys or direction buttons. Select Start AI to have the computer follow the '
+                'current safe route automatically. Zombies patrol after each move or wait. The blue path avoids '
+                'bombs and current zombie positions; it can change as they move.</div>'
+            )
+        )
+    v.use_event(game_root, "keydown", handle_keydown)
