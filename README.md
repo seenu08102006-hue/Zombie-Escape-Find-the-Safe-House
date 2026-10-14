@@ -15,7 +15,7 @@ Open the local URL printed by Solara in your browser. Stop the server with **Ctr
 
 ## Project files
 
-- `app.py` contains the Solara interface, maze generation, zombie patrols, and turn-based game logic.
+- `app.py` contains the Solara interface, maze generation, zombie pursuit, and turn-based game logic.
 - `a_star.py` provides the A* pathfinder used by the game.
 - `requirements.txt` lists the Solara dependency.
 
@@ -23,7 +23,7 @@ Open the local URL printed by Solara in your browser. Stop the server with **Ctr
 
 - Use the directional buttons to move and **Wait** to let the zombies patrol without moving.
 - Find the safe house (`H`) without stepping on bombs (`B`) or zombies (`Z`).
-- The blue route (`+`) shows a current safe path and recalculates after every turn; patrol movement can change it.
-- Zombies patrol within three tiles of their starting positions.
+- The blue route (`+`) shows the A*-calculated route to the safe house and recalculates after every turn to avoid zombies when possible.
+- Zombies appear behind you from level 1 and pursue you through the maze after each turn without passing you toward the safe house. If you step onto a zombie or it reaches your tile, the game ends.
 - Each level uses a new maze and location. More zombies appear as levels advance.
-- Use **Restart level** to retry, **Pause** to freeze the game, and **Next level** after reaching the safe house.
+- Use **Restart level** to retry, **Pause** to freeze the game, and **Next level** after reaching the safe house. After winning, press **Space** to start the next level.

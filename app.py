@@ -66,8 +66,6 @@ class Game:
     zombies: list[Zombie]
     traps: set[Position]
     route: list[Position]
-    exact_steps: int
-    steps: int = 0
     route_visible: bool = True
     paused: bool = False
     ended: Optional[str] = None
@@ -148,16 +146,65 @@ def add_detours(walls: list[list[bool]], start: Position, goal: Position) -> tup
     return main_path, detours
 
 
-def distances_from(walls: list[list[bool]], start: Position) -> dict[Position, int]:
+def distances_from(
+    walls: list[list[bool]],
+    start: Position,
+    blocked: set[Position] | None = None,
+) -> dict[Position, int]:
+    blocked = blocked or set()
     distances = {start: 0}
     queue = deque([start])
     while queue:
         current = queue.popleft()
         for neighbor in open_neighbors(walls, current):
-            if neighbor not in distances:
+            if neighbor not in blocked and neighbor not in distances:
                 distances[neighbor] = distances[current] + 1
                 queue.append(neighbor)
     return distances
+
+
+def ensure_alternate_route(
+    walls: list[list[bool]],
+    start: Position,
+    goal: Position,
+    blocked: set[Position],
+) -> bool:
+    route = path_on(walls, start, goal, blocked)
+    if len(route) < 5:
+        return False
+
+    height, width = len(walls), len(walls[0])
+    for index in range(1, len(route) - 3):
+        first, middle, last = route[index:index + 3]
+        if first[1] == middle[1] == last[1]:
+            offsets = ((0, -1), (0, 1))
+        elif first[0] == middle[0] == last[0]:
+            offsets = ((-1, 0), (1, 0))
+        else:
+            continue
+
+        for dx, dy in offsets:
+            bypass = [
+                (x + dx, y + dy)
+                for x, y in (first, middle, last)
+            ]
+            if any(
+                not (0 < x < width - 1 and 0 < y < height - 1)
+                or (x, y) in blocked
+                for x, y in bypass
+            ):
+                continue
+
+            walls_before = [walls[y][x] for x, y in bypass]
+            for x, y in bypass:
+                walls[y][x] = False
+            alternate = path_on(walls, start, goal, blocked | {middle})
+            if alternate:
+                return True
+            for (x, y), was_wall in zip(bypass, walls_before):
+                walls[y][x] = was_wall
+
+    return False
 
 
 def trap_count(level: int) -> int:
@@ -191,26 +238,80 @@ def start_level(level: int, score: int, seed: int) -> Game:
         detours[min(len(detours) - 1, int((index + 0.5) * len(detours) / count))]
         for index in range(count)
     }
+    if not ensure_alternate_route(walls, start, house, traps):
+        raise RuntimeError(f"Could not create two safe routes for level {level}.")
     exact_path = path_on(walls, start, house, traps)
     if not exact_path:
         raise RuntimeError(f"Could not find a bomb-free route for level {level}.")
 
     from_start = distances_from(walls, start)
-    from_house = distances_from(walls, house)
+    from_house = distances_from(walls, house, traps)
+    player_house_distance = from_house[start]
     safe_tiles = set(exact_path)
-    spawn_options = [
+    trailing_options = [
         (x, y)
         for y in range(1, height - 1)
         for x in range(1, width - 1)
         if not walls[y][x]
-        and from_start.get((x, y), 0) >= 10
-        and from_house.get((x, y), 0) >= 5
+        and from_house.get((x, y), 0) > player_house_distance
         and (x, y) not in safe_tiles
         and (x, y) not in traps
     ]
-    rng.shuffle(spawn_options)
-    zombie_count = 0 if level == 1 else min(level, 5, len(spawn_options))
-    zombies = [Zombie(tile, tile) for tile in spawn_options[:zombie_count]]
+
+    if not trailing_options:
+        start_x, start_y = start
+        adjacent_tiles = (
+            (start_x, start_y - 1),
+            (start_x, start_y + 1),
+            (start_x - 1, start_y),
+            (start_x + 1, start_y),
+        )
+        for tile in adjacent_tiles:
+            x, y = tile
+            if (
+                not (0 < x < width - 1 and 0 < y < height - 1)
+                or not walls[y][x]
+                or tile in traps
+            ):
+                continue
+            walls[y][x] = False
+            updated_from_house = distances_from(walls, house, traps)
+            if updated_from_house.get(tile, -1) > updated_from_house[start]:
+                from_house = updated_from_house
+                from_start = distances_from(walls, start)
+                exact_path = path_on(walls, start, house, traps)
+                safe_tiles = set(exact_path)
+                trailing_options = [tile]
+                break
+            walls[y][x] = True
+
+    if not trailing_options:
+        for tile in ((0, 1), (1, 0)):
+            x, y = tile
+            if tile in traps:
+                continue
+            walls[y][x] = False
+            updated_from_house = distances_from(walls, house, traps)
+            if updated_from_house.get(tile, -1) > updated_from_house[start]:
+                from_house = updated_from_house
+                from_start = distances_from(walls, start)
+                exact_path = path_on(walls, start, house, traps)
+                safe_tiles = set(exact_path)
+                trailing_options = [tile]
+                break
+            walls[y][x] = True
+
+    if not trailing_options:
+        raise RuntimeError(f"Could not create a trailing zombie spawn for level {level}.")
+
+    closest_distance = min(from_start[tile] for tile in trailing_options)
+    nearby_spawn_options = [
+        tile for tile in trailing_options
+        if from_start[tile] <= closest_distance + 4
+    ]
+    rng.shuffle(nearby_spawn_options)
+    zombie_count = min(max(1, level), 5, len(nearby_spawn_options))
+    zombies = [Zombie(tile, tile) for tile in nearby_spawn_options[:zombie_count]]
 
     location = LOCATIONS[(level - 1) % len(LOCATIONS)]
     return Game(
@@ -223,7 +324,6 @@ def start_level(level: int, score: int, seed: int) -> Game:
         zombies=zombies,
         traps=traps,
         route=exact_path,
-        exact_steps=len(exact_path) - 1,
         message=f"Level {level} · {location}. Reach the safe house without stepping on a bomb.",
         rng=rng,
     )
@@ -231,26 +331,80 @@ def start_level(level: int, score: int, seed: int) -> Game:
 
 def current_route(game: Game) -> list[Position]:
     occupied = {zombie.position for zombie in game.zombies}
-    return path_on(game.walls, game.player, game.house, game.traps | occupied)
+    safe_route = path_on(game.walls, game.player, game.house, game.traps | occupied)
+    if safe_route:
+        return safe_route
+
+    return path_on(game.walls, game.player, game.house, game.traps)
 
 
 def move_zombies(game: Game) -> None:
     occupied = {zombie.position for zombie in game.zombies}
+    distance_to_house = distances_from(game.walls, game.house, game.traps)
+    player_house_distance = distance_to_house.get(game.player)
+    if player_house_distance is None:
+        raise RuntimeError("Player has no safe path to the house.")
+
     for zombie in game.zombies:
         occupied.discard(zombie.position)
         options = [
             tile for tile in open_neighbors(game.walls, zombie.position)
-            if abs(tile[0] - zombie.home[0]) + abs(tile[1] - zombie.home[1]) <= 3
-            and tile != game.house
+            if tile != game.house
             and tile not in game.traps
             and tile not in occupied
         ]
-        forward = [tile for tile in options if tile != zombie.previous]
-        if forward:
-            options = forward
         zombie.previous = zombie.position
         if options:
-            zombie.position = game.rng.choice(options)
+            zombie_house_distance = distance_to_house.get(zombie.position)
+            if zombie_house_distance is None:
+                raise RuntimeError("Zombie has no safe path through the maze.")
+
+            distances_to_player = distances_from(
+                game.walls,
+                game.player,
+                game.traps | occupied,
+            )
+            if zombie_house_distance <= player_house_distance:
+                retreat_options = [
+                    tile for tile in options
+                    if distance_to_house.get(tile, -1) > zombie_house_distance
+                ]
+                if retreat_options:
+                    best_distance = min(
+                        distances_to_player.get(tile, float("inf"))
+                        for tile in retreat_options
+                    )
+                    best_options = [
+                        tile for tile in retreat_options
+                        if distances_to_player.get(tile, float("inf")) == best_distance
+                    ]
+                    zombie.position = game.rng.choice(best_options)
+                occupied.add(zombie.position)
+                continue
+
+            chase_path = path_on(
+                game.walls,
+                zombie.position,
+                game.player,
+                game.traps | occupied | {game.house},
+            )
+            trailing_options = [
+                tile for tile in options
+                if tile == game.player
+                or distance_to_house.get(tile, -1) > player_house_distance
+            ]
+            if len(chase_path) > 1 and chase_path[1] in trailing_options:
+                zombie.position = chase_path[1]
+            elif trailing_options:
+                best_distance = min(
+                    distances_to_player.get(tile, float("inf"))
+                    for tile in trailing_options
+                )
+                best_options = [
+                    tile for tile in trailing_options
+                    if distances_to_player.get(tile, float("inf")) == best_distance
+                ]
+                zombie.position = game.rng.choice(best_options)
         occupied.add(zombie.position)
 
 
@@ -272,12 +426,8 @@ def take_turn(game: Game, direction: str | None) -> None:
             end_game(game, "A zombie caught you! Retry the level to try again.")
             return
         game.player = target
-        game.steps += 1
         if game.player in game.traps:
             end_game(game, "BOOM! You stepped on a bomb trap. Retry the level to try again.")
-            return
-        if game.steps > game.exact_steps:
-            end_game(game, f"You used more than the {game.exact_steps} steps available on the exact route.")
             return
         if game.player == game.house:
             game.score += game.level * 500
@@ -478,6 +628,11 @@ def Page():
 
     def handle_keydown(_widget, _event, data) -> None:
         key = data.get("key", data.get("code")) if isinstance(data, dict) else None
+        if key in (" ", "Space", "Spacebar"):
+            if game.value.ended == "won" and not data.get("repeat", False):
+                next_level()
+            return
+
         direction = {
             "ArrowUp": "Up",
             "ArrowDown": "Down",
@@ -592,8 +747,6 @@ def Page():
                 f'<span class="game-stat-value">{status}</span></div>'
                 f'<div class="game-stat"><span class="game-stat-label">Score</span>'
                 f'<span class="game-stat-value">{state.score}</span></div>'
-                f'<div class="game-stat"><span class="game-stat-label">Steps</span>'
-                f'<span class="game-stat-value">{state.steps}/{state.exact_steps}</span></div>'
                 '</div>'
             )
         )
