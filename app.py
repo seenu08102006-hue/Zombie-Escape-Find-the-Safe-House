@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import copy
 import html
+import os
 import random
+import sqlite3
 from collections import deque
+from contextlib import closing
 from dataclasses import dataclass, field
+from pathlib import Path
 from threading import Event
 from typing import Optional
 
@@ -14,6 +18,14 @@ import solara
 from a_star import Position, a_star
 
 ALGORITHMS = ("A*", "BFS", "DFS")
+LOCAL_APP_DATA = os.environ.get("LOCALAPPDATA")
+PROGRESS_DIRECTORY = (
+    Path(LOCAL_APP_DATA) / "ZombieEscape"
+    if LOCAL_APP_DATA
+    else Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+    / "zombie_escape"
+)
+PROGRESS_FILE = PROGRESS_DIRECTORY / "progress.sqlite3"
 
 
 LOCATIONS = (
@@ -71,11 +83,54 @@ class Game:
     algorithm: str = "A*"
     started: bool = False
     has_moved: bool = False
-    route_visible: bool = True
+    route_visible: bool = False
+    alert: bool = False
+    visits: dict[Position, int] = field(default_factory=dict)
     paused: bool = False
     ended: Optional[str] = None
     message: str = ""
     rng: random.Random = field(default_factory=random.Random, repr=False)
+
+
+def _open_progress_store(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, timeout=10)
+    with connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS progress (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                level INTEGER NOT NULL CHECK (level > 0),
+                score INTEGER NOT NULL CHECK (score >= 0),
+                seed INTEGER NOT NULL
+            )
+            """
+        )
+    return connection
+
+
+def load_progress(path: Path = PROGRESS_FILE) -> tuple[int, int, int] | None:
+    with closing(_open_progress_store(path)) as connection:
+        row = connection.execute(
+            "SELECT level, score, seed FROM progress WHERE id = 1"
+        ).fetchone()
+    return tuple(row) if row is not None else None
+
+
+def save_progress(game: Game, path: Path = PROGRESS_FILE) -> None:
+    with closing(_open_progress_store(path)) as connection:
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO progress (id, level, score, seed)
+                VALUES (1, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    level = excluded.level,
+                    score = excluded.score,
+                    seed = excluded.seed
+                """,
+                (game.level, game.score, game.seed),
+            )
 
 
 def path_on(walls: list[list[bool]], start: Position, goal: Position,
@@ -366,13 +421,17 @@ def start_level(level: int, score: int, seed: int) -> Game:
 
 def current_route(game: Game) -> list[Position]:
     occupied = {zombie.position for zombie in game.zombies}
-    safe_route = path_on(
+    return path_on(
         game.walls, game.player, game.house, game.traps | occupied, game.algorithm
     )
-    if safe_route:
-        return safe_route
 
-    return path_on(game.walls, game.player, game.house, game.traps, game.algorithm)
+
+def stall(game: Game, reason: str = "No further safe move") -> None:
+    algorithm = game.algorithm
+    game.__dict__.update(start_level(game.level, game.score, game.seed).__dict__)
+    game.algorithm = algorithm
+    game.message = f"{reason} with {algorithm}. Please select another algorithm."
+    game.alert = True
 
 
 def no_path_message(algorithm: str) -> str:
@@ -458,6 +517,25 @@ def end_game(game: Game, message: str, outcome: str = "lost") -> None:
     game.message = message
 
 
+def entered_tile_too_often(game: Game, direction: str | None) -> bool:
+    before = game.player
+    take_turn(game, direction)
+    if game.player == before or game.ended:
+        return False
+    game.visits[game.player] = game.visits.get(game.player, 0) + 1
+    return game.visits[game.player] > 2
+
+
+def take_human_turn(game: Game, direction: str) -> None:
+    if entered_tile_too_often(game, direction):
+        stall(game, "You repeated the same steps more than twice. No further move")
+
+
+def take_ai_turn(game: Game, direction: str) -> None:
+    if entered_tile_too_often(game, direction):
+        stall(game, "No further move by AI")
+
+
 def take_turn(game: Game, direction: str | None) -> None:
     if not game.started or game.ended or game.paused:
         return
@@ -482,12 +560,15 @@ def take_turn(game: Game, direction: str | None) -> None:
     move_zombies(game)
     if any(zombie.position == game.player for zombie in game.zombies):
         end_game(game, "A roaming zombie caught you! Retry the level to try again.")
+    elif not current_route(game):
+        stall(game)
     else:
         game.message = "You wait as the zombies patrol." if direction is None else "The zombies patrol nearby."
 
 
 def board_markup(game: Game) -> str:
-    route = set(current_route(game)) if game.route_visible else set()
+    path = current_route(game) if game.route_visible else []
+    route = {tile: index for index, tile in enumerate(path)}
     zombies = {zombie.position for zombie in game.zombies}
     tiles = []
     for y, row in enumerate(game.walls):
@@ -507,8 +588,13 @@ def board_markup(game: Game) -> str:
                 cell, kind = "", "route"
             else:
                 cell, kind = "", "floor"
+            classes = f"maze-tile {kind}"
+            style = ""
+            if kind == "route" and not game.has_moved:
+                classes += " route-in"
+                style = f' style="animation-delay:{route[point] * 40}ms"'
             tiles.append(
-                f'<div class="maze-tile {kind}" role="gridcell">{cell}</div>'
+                f'<div class="{classes}" role="gridcell"{style}>{cell}</div>'
             )
     return (
         f'<div class="maze-board" role="grid" aria-label="Maze, level {game.level}" '
@@ -594,6 +680,11 @@ body { margin: 0; }
 .maze-tile.route {
     background: #075185; box-shadow: inset 0 0 0 2px #078cf4;
 }
+.maze-tile.route.route-in { animation: route-in .35s ease-out both; }
+@keyframes route-in {
+    from { opacity: 0; transform: scale(.3); }
+    to { opacity: 1; transform: none; }
+}
 .maze-tile.player, .maze-tile.zombie, .maze-tile.house, .maze-tile.bomb {
     z-index: 1; filter: drop-shadow(0 2px 2px #0009);
 }
@@ -627,6 +718,10 @@ body { margin: 0; }
     margin-top: 14px; padding: 12px 15px; border: 1px solid #30423a;
     border-radius: 9px; background: #111a17; color: #c5d1ca; font-size: 13px;
 }
+.game-message.alert {
+    border-color: #ff4d4d; background: #3a1414; color: #ff6b6b; font-weight: 700;
+}
+.algorithm-picker .game-message.alert { margin-top: 0; flex: 1 1 260px; align-self: center; }
 .game-help { margin-top: 16px; color: #8d9e95; font-size: 12px; line-height: 1.6; }
 .algorithm-picker {
     width: 100%; max-width: 100%; min-width: 0; flex-wrap: wrap;
@@ -688,18 +783,39 @@ body { margin: 0; }
 
 @solara.component
 def Page():
-    initial_game = solara.use_memo(lambda: start_level(1, 0, random.randrange(2**32)), [])
+    def initialize_game() -> Game:
+        progress = load_progress()
+        if progress is None:
+            game = start_level(1, 0, random.randrange(2**32))
+        else:
+            level, score, seed = progress
+            game = start_level(level, score, seed)
+            game.message = (
+                f"Progress restored. Level {level} is ready; choose an algorithm "
+                "and press Start game."
+            )
+        save_progress(game)
+        return game
+
+    initial_game = solara.use_memo(initialize_game, [])
     game = solara.use_reactive(initial_game)
     ai_running, set_ai_running = solara.use_state(False)
 
     def change(action):
         updated = copy.deepcopy(game.value)
         action(updated)
+        current = game.value
+        if (updated.level, updated.score, updated.seed) != (
+            current.level,
+            current.score,
+            current.seed,
+        ):
+            save_progress(updated)
         game.value = updated
 
     def move(direction: str) -> None:
         set_ai_running(False)
-        change(lambda state: take_turn(state, direction))
+        change(lambda state: take_human_turn(state, direction))
 
     def wait() -> None:
         set_ai_running(False)
@@ -710,6 +826,7 @@ def Page():
         current = game.value
         restarted = start_level(current.level, current.score, current.seed)
         restarted.algorithm = current.algorithm
+        restarted.route_visible = current.route_visible
         restarted.started = current.started
         restarted.message = (
             f"Level {restarted.level} restarted with {restarted.algorithm}. Find the safe house!"
@@ -726,13 +843,30 @@ def Page():
         next_game.message = (
             f"Level {next_game.level}: choose a pathfinding algorithm and press Start game."
         )
+        save_progress(next_game)
         game.value = next_game
+
+    def previous_level() -> None:
+        set_ai_running(False)
+        current = game.value
+        previous_game = start_level(current.level - 1, current.score, current.seed)
+        previous_game.algorithm = current.algorithm
+        previous_game.message = (
+            f"Returned to level {previous_game.level}. Choose an algorithm "
+            "and press Start game."
+        )
+        save_progress(previous_game)
+        game.value = previous_game
 
     def select_algorithm(algorithm: str) -> None:
         def update(state: Game) -> None:
             state.algorithm = algorithm
-            if not path_on(state.walls, state.player, state.house, state.traps, algorithm):
+            state.visits = {}
+            state.alert = False
+            if not current_route(state):
                 state.message = no_path_message(algorithm)
+            elif state.started:
+                state.message = f"{algorithm} selected. A safe route is available."
             else:
                 state.message = f"{algorithm} selected. Start the game when you are ready."
 
@@ -740,12 +874,12 @@ def Page():
 
     def start_game() -> None:
         def update(state: Game) -> None:
-            if not path_on(
-                state.walls, state.player, state.house, state.traps, state.algorithm
-            ):
+            if not current_route(state):
                 state.message = no_path_message(state.algorithm)
                 return
             state.started = True
+            state.route_visible = True
+            state.alert = False
             state.message = f"Game started with {state.algorithm}. Find the safe house!"
 
         change(update)
@@ -784,9 +918,7 @@ def Page():
 
             route = current_route(state)
             if len(route) < 2:
-                change(lambda current: setattr(
-                    current, "message", no_path_message(current.algorithm)
-                ))
+                change(stall)
                 set_ai_running(False)
                 return
 
@@ -799,8 +931,8 @@ def Page():
             if direction is None:
                 raise RuntimeError(f"AI route contains a non-adjacent step: {current} to {following}.")
 
-            change(lambda current_state: take_turn(current_state, direction))
-            if game.value.ended:
+            change(lambda current_state: take_ai_turn(current_state, direction))
+            if game.value.ended or not game.value.started:
                 set_ai_running(False)
                 return
             cancel.wait(0.4)
@@ -822,6 +954,7 @@ def Page():
         change(update)
 
     state = game.value
+    route_available = bool(current_route(state))
     location = LOCATIONS[(state.level - 1) % len(LOCATIONS)]
     solara.Title("Zombie Escape: Find the Safe House")
     solara.Style(GAME_STYLES)
@@ -841,11 +974,11 @@ def Page():
                     'Don’t let the horde catch you.</p>'
                 )
             )
-            if not state.has_moved and state.ended is None:
+            if state.ended is None and (not state.has_moved or not route_available):
                 solara.HTML(
                     unsafe_innerHTML=(
                         '<div class="game-eyebrow" style="margin:18px 0 0">'
-                        'CHOOSE YOUR PATHFINDING ALGORITHM</div>'
+                        f'{"CHOOSE YOUR PATHFINDING ALGORITHM" if route_available else "NO SAFE ROUTE — CHOOSE ANOTHER ALGORITHM"}</div>'
                     )
                 )
                 with solara.Row(classes=["algorithm-picker"], gap="10px"):
@@ -855,11 +988,16 @@ def Page():
                         values=list(ALGORITHMS),
                         on_value=select_algorithm,
                     )
-                    solara.Button(
-                        "Start game",
-                        on_click=start_game,
-                        classes=["start-game-button"],
-                    )
+                    if not state.started:
+                        solara.Button(
+                            "Start game",
+                            on_click=start_game,
+                            classes=["start-game-button"],
+                        )
+                    if state.alert:
+                        solara.HTML(
+                            unsafe_innerHTML=f'<div class="game-message alert">{html.escape(state.message)}</div>'
+                        )
             with solara.Row(classes=["game-heading-actions"], gap="10px"):
                 solara.Button(
                     "Stop AI" if ai_running else "Start AI",
@@ -917,6 +1055,12 @@ def Page():
             with solara.Row(classes=["game-heading-actions"], gap="8px"):
                 solara.Button("Wait", on_click=wait, disabled=not can_move, classes=["game-button"])
                 solara.Button("Restart level", on_click=restart, classes=["game-button"])
+                if state.level > 1:
+                    solara.Button(
+                        "Previous level",
+                        on_click=previous_level,
+                        classes=["game-button"],
+                    )
             with solara.Div(classes=["game-move-controls"]):
                 solara.Button("↑", on_click=lambda: move("Up"), disabled=not can_move, classes=["game-button"])
                 solara.Button("←", on_click=lambda: move("Left"), disabled=not can_move, classes=["game-button"])
@@ -924,7 +1068,7 @@ def Page():
                 solara.Button("↓", on_click=lambda: move("Down"), disabled=not can_move, classes=["game-button"])
         solara.HTML(
             unsafe_innerHTML=(
-                f'<div class="game-message">{html.escape(state.message)}</div>'
+                f'<div class="game-message">{"" if state.alert else html.escape(state.message)}</div>'
                 '<div class="game-help"><strong>How to play:</strong> Click inside or Tab to focus the game, '
                 'choose A*, BFS, or DFS and press Start game, then use the keyboard '
                 'arrow keys or direction buttons. Select Start AI to have the computer follow the '
