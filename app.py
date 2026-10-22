@@ -780,6 +780,9 @@ body { margin: 0; }
 }
 """
 
+# Every fresh run (and every code reload) starts from level 1.
+PROGRESS_FILE.unlink(missing_ok=True)
+
 
 @solara.component
 def Page():
