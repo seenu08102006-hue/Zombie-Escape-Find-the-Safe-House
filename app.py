@@ -1,3 +1,5 @@
+"""Zombie Escape: a turn-based Solara maze game where A*, BFS or DFS plans the route to the safe house."""
+
 from __future__ import annotations
 
 import copy
@@ -17,7 +19,9 @@ import solara
 
 from a_star import Position, a_star
 
+# Pathfinding algorithms the player can choose from.
 ALGORITHMS = ("A*", "BFS", "DFS")
+# Progress is saved in the OS application-data folder (LOCALAPPDATA on Windows, XDG data dir elsewhere).
 LOCAL_APP_DATA = os.environ.get("LOCALAPPDATA")
 PROGRESS_DIRECTORY = (
     Path(LOCAL_APP_DATA) / "ZombieEscape"
@@ -28,6 +32,7 @@ PROGRESS_DIRECTORY = (
 PROGRESS_FILE = PROGRESS_DIRECTORY / "progress.sqlite3"
 
 
+# Location names shown in the header; levels cycle through them.
 LOCATIONS = (
     "Overgrown Village",
     "Pinewood Forest",
@@ -35,12 +40,14 @@ LOCATIONS = (
     "Ashen City",
     "Toxic Marsh",
 )
+# Move name -> (dx, dy) step on the board, using (x, y) coordinates.
 DIRECTIONS: dict[str, Position] = {
     "Up": (0, -1),
     "Down": (0, 1),
     "Left": (-1, 0),
     "Right": (1, 0),
 }
+# Inline SVG icons drawn on the player and safe-house tiles.
 PLAYER_ICON = (
     '<svg class="game-icon player-icon" viewBox="0 0 24 24" aria-hidden="true">'
     '<path d="M7 10h3v7H7z" fill="#c77c42"/>'
@@ -64,6 +71,8 @@ HOUSE_ICON = (
 
 @dataclass
 class Zombie:
+    """A zombie on the board: its current tile, its spawn tile and the tile it left last turn."""
+
     position: Position
     home: Position
     previous: Optional[Position] = None
@@ -71,13 +80,17 @@ class Zombie:
 
 @dataclass
 class Game:
+    """Complete state of one level: maze, actors, route, chosen algorithm and UI flags."""
+
     level: int
     score: int
     seed: int
+    # walls[y][x] is True for a wall tile.
     walls: list[list[bool]]
     player: Position
     house: Position
     zombies: list[Zombie]
+    # Bomb tiles; stepping on one ends the game.
     traps: set[Position]
     route: list[Position]
     algorithm: str = "A*"
@@ -85,14 +98,17 @@ class Game:
     has_moved: bool = False
     route_visible: bool = False
     alert: bool = False
+    # How many times the player or AI entered each tile; a third entry stalls the level.
     visits: dict[Position, int] = field(default_factory=dict)
     paused: bool = False
+    # None while playing, otherwise "won" or "lost".
     ended: Optional[str] = None
     message: str = ""
     rng: random.Random = field(default_factory=random.Random, repr=False)
 
 
 def _open_progress_store(path: Path) -> sqlite3.Connection:
+    """Open the SQLite progress file, creating it and its single-row table if needed."""
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path, timeout=10)
     with connection:
@@ -110,6 +126,7 @@ def _open_progress_store(path: Path) -> sqlite3.Connection:
 
 
 def load_progress(path: Path = PROGRESS_FILE) -> tuple[int, int, int] | None:
+    """Return the saved (level, score, seed), or None when nothing has been saved yet."""
     with closing(_open_progress_store(path)) as connection:
         row = connection.execute(
             "SELECT level, score, seed FROM progress WHERE id = 1"
@@ -118,6 +135,7 @@ def load_progress(path: Path = PROGRESS_FILE) -> tuple[int, int, int] | None:
 
 
 def save_progress(game: Game, path: Path = PROGRESS_FILE) -> None:
+    """Save the game's level, score and seed, replacing any earlier save."""
     with closing(_open_progress_store(path)) as connection:
         with connection:
             connection.execute(
@@ -135,11 +153,17 @@ def save_progress(game: Game, path: Path = PROGRESS_FILE) -> None:
 
 def path_on(walls: list[list[bool]], start: Position, goal: Position,
             blocked: set[Position] | None = None, algorithm: str = "A*") -> list[Position]:
+    """Find a route from start to goal with the chosen algorithm (A*, BFS or DFS).
+
+    Walls and the tiles in blocked cannot be entered. Returns the route as (x, y)
+    tiles including both ends, or an empty list when no route exists.
+    """
     blocked = blocked or set()
     grid = [
         [int(walls[y][x] or (x, y) in blocked) for x in range(len(walls[0]))]
         for y in range(len(walls))
     ]
+    # a_star.py works in (row, col), so swap the coordinates on the way in and out.
     if algorithm == "A*":
         path = a_star(grid, (start[1], start[0]), (goal[1], goal[0]))
         return [(x, y) for y, x in path] if path else []
@@ -148,6 +172,7 @@ def path_on(walls: list[list[bool]], start: Position, goal: Position,
 
     if walls[start[1]][start[0]] or walls[goal[1]][goal[0]]:
         return []
+    # BFS takes tiles from the front of the queue (shortest route); DFS takes them from the back (a stack).
     pending = deque([start])
     previous: dict[Position, Position | None] = {start: None}
     while pending:
@@ -155,6 +180,7 @@ def path_on(walls: list[list[bool]], start: Position, goal: Position,
         if current == goal:
             break
         neighbors = open_neighbors(walls, current)
+        # Reverse so the stack pops neighbors in the same order BFS visits them.
         if algorithm == "DFS":
             neighbors.reverse()
         for neighbor in neighbors:
@@ -163,6 +189,7 @@ def path_on(walls: list[list[bool]], start: Position, goal: Position,
             previous[neighbor] = current
             pending.append(neighbor)
 
+    # Rebuild the route by following the previous links back from the goal.
     if goal not in previous:
         return []
     path: list[Position] = []
@@ -175,6 +202,7 @@ def path_on(walls: list[list[bool]], start: Position, goal: Position,
 
 
 def open_neighbors(walls: list[list[bool]], point: Position) -> list[Position]:
+    """Return the non-wall tiles directly above, below, left and right of point."""
     x, y = point
     candidates = ((x, y - 1), (x, y + 1), (x - 1, y), (x + 1, y))
     return [
@@ -186,6 +214,11 @@ def open_neighbors(walls: list[list[bool]], point: Position) -> list[Position]:
 
 
 def make_maze(width: int, height: int, rng: random.Random, level: int) -> list[list[bool]]:
+    """Carve a random maze with a depth-first backtracker, then open a few walls to add loops.
+
+    Higher levels get fewer loops, so there are fewer shortcuts.
+    """
+    # Start with solid walls and carve passages two tiles at a time from (1, 1).
     walls = [[True] * width for _ in range(height)]
     start = (1, 1)
     walls[start[1]][start[0]] = False
@@ -206,6 +239,7 @@ def make_maze(width: int, height: int, rng: random.Random, level: int) -> list[l
         walls[ny][nx] = False
         stack.append((nx, ny))
 
+    # Remove some single walls between two open tiles to create extra loops.
     loop_chance = max(0.02, 0.08 - (level - 1) * 0.003)
     for y in range(1, height - 1):
         for x in range(1, width - 1):
@@ -220,6 +254,10 @@ def make_maze(width: int, height: int, rng: random.Random, level: int) -> list[l
 
 
 def add_detours(walls: list[list[bool]], start: Position, goal: Position) -> tuple[list[Position], list[Position]]:
+    """Open a tile at each corner of the shortest path so that corner can be bypassed.
+
+    Returns the shortest path and the opened detour tiles, which are where bombs can be placed.
+    """
     main_path = path_on(walls, start, goal)
     path_tiles = set(main_path)
     detours: list[Position] = []
@@ -241,6 +279,7 @@ def distances_from(
     start: Position,
     blocked: set[Position] | None = None,
 ) -> dict[Position, int]:
+    """Return the BFS step count from start to every reachable tile, avoiding blocked tiles."""
     blocked = blocked or set()
     distances = {start: 0}
     queue = deque([start])
@@ -259,6 +298,12 @@ def ensure_alternate_route(
     goal: Position,
     blocked: set[Position],
 ) -> bool:
+    """Make sure a second bomb-free route exists from start to goal.
+
+    Opens a three-tile bypass beside a straight stretch of the route and keeps it
+    only if the goal is still reachable with that stretch's middle tile blocked.
+    Returns True once an alternate route exists.
+    """
     route = path_on(walls, start, goal, blocked)
     if len(route) < 5:
         return False
@@ -298,19 +343,27 @@ def ensure_alternate_route(
 
 
 def trap_count(level: int) -> int:
+    """Return how many bombs a level has: 3 up to level 4, then level - 1, capped at 8."""
     if level <= 0:
         raise ValueError("Level must be a positive integer.")
     return 3 if level < 5 else min(8, level - 1)
 
 
 def start_level(level: int, score: int, seed: int) -> Game:
+    """Build a new, reproducible level from its number and the run's seed.
+
+    Generates the maze, places bombs so at least two safe routes remain, and spawns
+    zombies behind the player (farther from the house than the start).
+    """
     if level <= 0:
         raise ValueError("Level must be a positive integer.")
+    # The maze grows every 3 levels, up to 23 x 17 tiles.
     size_step = min((level - 1) // 3, 2)
     width, height = min(23, 19 + 2 * size_step), min(17, 13 + 2 * size_step)
     start, house = (1, 1), (width - 2, height - 2)
     rng = random.Random((seed + level * 92821 + 47311) & 0xFFFFFFFF)
     best: tuple[list[list[bool]], list[Position], list[Position]] | None = None
+    # Try up to 32 mazes and keep the first with enough detour tiles for the bombs.
     for _ in range(32):
         walls = make_maze(width, height, rng, level)
         safe_path, detours = add_detours(walls, start, house)
@@ -323,6 +376,7 @@ def start_level(level: int, score: int, seed: int) -> Game:
         raise RuntimeError(f"Could not generate enough alternate route tiles for level {level}.")
 
     walls, safe_path, detours = best
+    # Spread the bombs evenly along the detour tiles.
     count = min(trap_count(level), len(detours))
     traps = {
         detours[min(len(detours) - 1, int((index + 0.5) * len(detours) / count))]
@@ -334,6 +388,7 @@ def start_level(level: int, score: int, seed: int) -> Game:
     if not exact_path:
         raise RuntimeError(f"Could not find a bomb-free route for level {level}.")
 
+    # Zombies may only spawn on tiles farther from the house than the player and off the safe route.
     from_start = distances_from(walls, start)
     from_house = distances_from(walls, house, traps)
     player_house_distance = from_house[start]
@@ -348,6 +403,7 @@ def start_level(level: int, score: int, seed: int) -> Game:
         and (x, y) not in traps
     ]
 
+    # No spawn tile behind the player: try opening a wall next to the start.
     if not trailing_options:
         start_x, start_y = start
         adjacent_tiles = (
@@ -375,6 +431,7 @@ def start_level(level: int, score: int, seed: int) -> Game:
                 break
             walls[y][x] = True
 
+    # Still none: try opening the outer wall beside the start.
     if not trailing_options:
         for tile in ((0, 1), (1, 0)):
             x, y = tile
@@ -391,9 +448,11 @@ def start_level(level: int, score: int, seed: int) -> Game:
                 break
             walls[y][x] = True
 
+    # Fail loudly rather than start a level with no valid zombie spawn.
     if not trailing_options:
         raise RuntimeError(f"Could not create a trailing zombie spawn for level {level}.")
 
+    # Spawn up to 5 zombies (one per level) on random tiles near the player's start.
     closest_distance = min(from_start[tile] for tile in trailing_options)
     nearby_spawn_options = [
         tile for tile in trailing_options
@@ -420,6 +479,7 @@ def start_level(level: int, score: int, seed: int) -> Game:
 
 
 def current_route(game: Game) -> list[Position]:
+    """Return the chosen algorithm's route from the player to the house, avoiding bombs and zombies."""
     occupied = {zombie.position for zombie in game.zombies}
     return path_on(
         game.walls, game.player, game.house, game.traps | occupied, game.algorithm
@@ -427,6 +487,7 @@ def current_route(game: Game) -> list[Position]:
 
 
 def stall(game: Game, reason: str = "No further safe move") -> None:
+    """Restart the level in place and show a red alert asking for another algorithm."""
     algorithm = game.algorithm
     game.__dict__.update(start_level(game.level, game.score, game.seed).__dict__)
     game.algorithm = algorithm
@@ -435,6 +496,7 @@ def stall(game: Game, reason: str = "No further safe move") -> None:
 
 
 def no_path_message(algorithm: str) -> str:
+    """Return a warning that names the two other algorithms to try."""
     alternatives = [name for name in ALGORITHMS if name != algorithm]
     return (
         f"{algorithm} cannot find a safe path. Choose one of the other algorithms: "
@@ -443,6 +505,12 @@ def no_path_message(algorithm: str) -> str:
 
 
 def move_zombies(game: Game) -> None:
+    """Move every zombie one tile.
+
+    A zombie as close to the house as the player (or closer) retreats away from
+    the house. Otherwise it chases the player, but only onto tiles farther from
+    the house than the player, so zombies always pursue from behind.
+    """
     occupied = {zombie.position for zombie in game.zombies}
     distance_to_house = distances_from(game.walls, game.house, game.traps)
     player_house_distance = distance_to_house.get(game.player)
@@ -468,6 +536,7 @@ def move_zombies(game: Game) -> None:
                 game.player,
                 game.traps | occupied,
             )
+            # Ahead of the player: step back toward tiles farther from the house, staying near the player.
             if zombie_house_distance <= player_house_distance:
                 retreat_options = [
                     tile for tile in options
@@ -486,6 +555,7 @@ def move_zombies(game: Game) -> None:
                 occupied.add(zombie.position)
                 continue
 
+            # Behind the player: follow the shortest chase path if its next step stays behind the player.
             chase_path = path_on(
                 game.walls,
                 zombie.position,
@@ -513,11 +583,13 @@ def move_zombies(game: Game) -> None:
 
 
 def end_game(game: Game, message: str, outcome: str = "lost") -> None:
+    """Mark the level as won or lost and show the message."""
     game.ended = outcome
     game.message = message
 
 
 def entered_tile_too_often(game: Game, direction: str | None) -> bool:
+    """Play the turn and return True when the player has now entered the same tile a third time."""
     before = game.player
     take_turn(game, direction)
     if game.player == before or game.ended:
@@ -527,16 +599,23 @@ def entered_tile_too_often(game: Game, direction: str | None) -> bool:
 
 
 def take_human_turn(game: Game, direction: str) -> None:
+    """Play a move made by the player, restarting the level if they keep repeating tiles."""
     if entered_tile_too_often(game, direction):
         stall(game, "You repeated the same steps more than twice. No further move")
 
 
 def take_ai_turn(game: Game, direction: str) -> None:
+    """Play a move made by the AI, restarting the level if it keeps repeating tiles."""
     if entered_tile_too_often(game, direction):
         stall(game, "No further move by AI")
 
 
 def take_turn(game: Game, direction: str | None) -> None:
+    """Play one turn: move the player (None means wait), then move the zombies.
+
+    Ends the game on a bomb, a zombie or the safe house, and stalls the level when
+    the chosen algorithm can no longer find a safe route.
+    """
     if not game.started or game.ended or game.paused:
         return
     if direction is not None:
@@ -567,6 +646,7 @@ def take_turn(game: Game, direction: str | None) -> None:
 
 
 def board_markup(game: Game) -> str:
+    """Return the maze as an HTML grid, one tile per cell, with the route shown when visible."""
     path = current_route(game) if game.route_visible else []
     route = {tile: index for index, tile in enumerate(path)}
     zombies = {zombie.position for zombie in game.zombies}
@@ -590,6 +670,7 @@ def board_markup(game: Game) -> str:
                 cell, kind = "", "floor"
             classes = f"maze-tile {kind}"
             style = ""
+            # Before the first move, animate the route in tile by tile.
             if kind == "route" and not game.has_moved:
                 classes += " route-in"
                 style = f' style="animation-delay:{route[point] * 40}ms"'
@@ -603,6 +684,7 @@ def board_markup(game: Game) -> str:
     )
 
 
+# CSS for the page, board, tiles, buttons and phone layout.
 GAME_STYLES = """
 html, body, #root, .solara-app, .v-application, .v-application__wrap,
 .v-main, .v-main__wrap {
@@ -786,7 +868,10 @@ PROGRESS_FILE.unlink(missing_ok=True)
 
 @solara.component
 def Page():
+    """The game page: header, algorithm picker, stats, board and controls."""
+
     def initialize_game() -> Game:
+        """Load the saved level, or start level 1 with a new random seed, and save it."""
         progress = load_progress()
         if progress is None:
             game = start_level(1, 0, random.randrange(2**32))
@@ -805,6 +890,7 @@ def Page():
     ai_running, set_ai_running = solara.use_state(False)
 
     def change(action):
+        """Apply action to a copy of the game state, save progress if it changed, and re-render."""
         updated = copy.deepcopy(game.value)
         action(updated)
         current = game.value
@@ -817,14 +903,17 @@ def Page():
         game.value = updated
 
     def move(direction: str) -> None:
+        """Move the player one tile and stop the AI."""
         set_ai_running(False)
         change(lambda state: take_human_turn(state, direction))
 
     def wait() -> None:
+        """Skip the player's move so only the zombies move."""
         set_ai_running(False)
         change(lambda state: take_turn(state, None))
 
     def restart() -> None:
+        """Restart the current level, keeping the chosen algorithm and whether the game has started."""
         set_ai_running(False)
         current = game.value
         restarted = start_level(current.level, current.score, current.seed)
@@ -839,6 +928,7 @@ def Page():
         game.value = restarted
 
     def next_level() -> None:
+        """Start the next level and save it as the current progress."""
         set_ai_running(False)
         current = game.value
         next_game = start_level(current.level + 1, current.score, current.seed)
@@ -850,6 +940,7 @@ def Page():
         game.value = next_game
 
     def previous_level() -> None:
+        """Go back one level and save it as the current progress."""
         set_ai_running(False)
         current = game.value
         previous_game = start_level(current.level - 1, current.score, current.seed)
@@ -862,6 +953,7 @@ def Page():
         game.value = previous_game
 
     def select_algorithm(algorithm: str) -> None:
+        """Switch algorithm, reset the tile-visit counts, and report whether it finds a safe route."""
         def update(state: Game) -> None:
             state.algorithm = algorithm
             state.visits = {}
@@ -876,6 +968,7 @@ def Page():
         change(update)
 
     def start_game() -> None:
+        """Start the level and reveal the route, if the chosen algorithm finds one."""
         def update(state: Game) -> None:
             if not current_route(state):
                 state.message = no_path_message(state.algorithm)
@@ -888,6 +981,7 @@ def Page():
         change(update)
 
     def handle_keydown(_widget, _event, data) -> None:
+        """Arrow keys move the player; Space starts the next level after a win."""
         key = data.get("key", data.get("code")) if isinstance(data, dict) else None
         if key in (" ", "Space", "Spacebar"):
             if game.value.ended == "won" and not data.get("repeat", False):
@@ -908,6 +1002,7 @@ def Page():
             move(direction)
 
     def run_ai(cancel: Event) -> None:
+        """Background loop: while the AI is on, take the first step of the route every 0.4 seconds."""
         if not ai_running:
             return
         while not cancel.is_set():
@@ -943,6 +1038,7 @@ def Page():
     solara.use_thread(run_ai, dependencies=[ai_running])
 
     def toggle_pause() -> None:
+        """Pause or resume the game."""
         def update(state: Game) -> None:
             state.paused = not state.paused
             state.message = "Game paused." if state.paused else "Back in the maze."
@@ -950,12 +1046,14 @@ def Page():
         change(update)
 
     def toggle_route() -> None:
+        """Show or hide the safe route on the board."""
         def update(state: Game) -> None:
             state.route_visible = not state.route_visible
             state.message = "Safe path shown." if state.route_visible else "Safe path hidden."
 
         change(update)
 
+    # Render the page from the current game state.
     state = game.value
     route_available = bool(current_route(state))
     location = LOCATIONS[(state.level - 1) % len(LOCATIONS)]
@@ -968,6 +1066,7 @@ def Page():
         attributes={"tabindex": "0"},
     )
     with game_root:
+        # Header: level and location, title, algorithm picker and main buttons.
         with solara.Div(classes=["game-heading"]):
             solara.HTML(
                 unsafe_innerHTML=(
@@ -977,6 +1076,7 @@ def Page():
                     'Don’t let the horde catch you.</p>'
                 )
             )
+            # The algorithm picker shows until the first move, or whenever no safe route exists.
             if state.ended is None and (not state.has_moved or not route_available):
                 solara.HTML(
                     unsafe_innerHTML=(
@@ -1036,8 +1136,10 @@ def Page():
                 '</div>'
             )
         )
+        # The maze board.
         with solara.Div(classes=["maze-frame"]):
             solara.HTML(unsafe_innerHTML=board_markup(state))
+        # Legend, plus Next level or Try again once the level has ended.
         with solara.Div(classes=["game-below"]):
             solara.HTML(
                 unsafe_innerHTML=(
@@ -1054,6 +1156,7 @@ def Page():
                 solara.Button("Next level", on_click=next_level, classes=["game-button", "primary"])
             elif state.ended == "lost":
                 solara.Button("Try again", on_click=restart, classes=["game-button", "primary"])
+        # Wait, restart and previous-level buttons, and the on-screen arrow pad.
         with solara.Div(classes=["game-controls"]):
             with solara.Row(classes=["game-heading-actions"], gap="8px"):
                 solara.Button("Wait", on_click=wait, disabled=not can_move, classes=["game-button"])
@@ -1079,4 +1182,5 @@ def Page():
                 'bombs and current zombie positions; it can change as they move.</div>'
             )
         )
+    # Listen for key presses on the game area.
     v.use_event(game_root, "keydown", handle_keydown)
